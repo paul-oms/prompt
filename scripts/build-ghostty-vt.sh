@@ -37,7 +37,7 @@ if [[ ! -f "$SRC/build.zig" ]]; then
   echo "==> downloading Ghostty ($GHOSTTY_REF)"
   rm -rf "$SRC" "$CACHE/ghostty-src"
   mkdir -p "$CACHE/ghostty-src"
-  curl -fsSL "https://github.com/ghostty-org/ghostty/archive/refs/heads/$GHOSTTY_REF.tar.gz" \
+  curl -fsSL "https://github.com/ghostty-org/ghostty/archive/$GHOSTTY_REF.tar.gz" \
     | tar -xz -C "$CACHE/ghostty-src" --strip-components=1
   mv "$CACHE/ghostty-src" "$SRC"
 fi

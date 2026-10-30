@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Keep release builds on the exact Ghostty revision the bindings were
+  # generated from. Update this together with vendor/ghostty-vt.
+  GHOSTTY_REF: cf0ab14aed55315a53de668bc1bbcf4a13ce0ddd
+
+jobs:
+  build-dmg:
+    name: macOS ${{ matrix.macos }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-26 is the arm64 macOS 26 runner.
+          - macos: "26"
+            runner: macos-26
+          # macOS 27 is currently exposed through GitHub's Xcode 27 image.
+          - macos: "27"
+            runner: xcode-27
+    env:
+      MACOS_VERSION: ${{ matrix.macos }}
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos }}.0
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tags must look like 0.0.1 (got '$GITHUB_REF_NAME')"
+            exit 1
+          fi
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-${{ matrix.macos }}
+
+      - name: Build libghostty-vt
+        run: scripts/build-ghostty-vt.sh
+
+      - name: Build and package Prompt
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          cargo build --release --locked
+          scripts/package-macos.sh
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v7
+        with:
+          name: prompt-macos-${{ matrix.macos }}
+          path: |
+            target/macos/*.dmg
+            target/macos/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish release
+    needs: build-dmg
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download DMGs
+        uses: actions/download-artifact@v8
+        with:
+          pattern: prompt-macos-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          mapfile -t assets < <(find dist -type f \( -name '*.dmg' -o -name '*.sha256' \) -print | sort)
+          if [[ ${#assets[@]} -eq 0 ]]; then
+            echo "::error::No release assets were downloaded"
+            exit 1
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$TAG" "${assets[@]}" \
+              --verify-tag \
+              --title "Prompt $TAG" \
+              --generate-notes
+          fi

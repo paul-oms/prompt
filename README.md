@@ -14,7 +14,17 @@ and semantic prompt tracking are Ghostty's, not a reimplementation.
 
 ![Prompt screenshot](docs/screenshot.png)
 
-## What works in v0.1
+## Download
+
+Release builds support the two latest macOS versions on Apple Silicon:
+
+- [Prompt for macOS 26 (arm64)](https://github.com/paul-oms/prompt/releases/latest/download/Prompt-macos-26-arm64.dmg)
+- [Prompt for macOS 27 (arm64)](https://github.com/paul-oms/prompt/releases/latest/download/Prompt-macos-27-arm64.dmg)
+
+The DMGs are ad-hoc signed but not notarized yet. If macOS blocks the first
+launch, right-click **Prompt.app**, choose **Open**, then confirm.
+
+## What works
 
 - **Editor-grade command entry** — selection, click-to-place caret, word and
   line movement, cut/copy/paste, undo/redo, smart Home, multiline commands,
