@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#252b3d"/>
+      <stop offset="0.52" stop-color="#171b26"/>
+      <stop offset="1" stop-color="#0c0e14"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.48" r="0.58">
+      <stop offset="0" stop-color="#7aa2f7" stop-opacity="0.30"/>
+      <stop offset="0.6" stop-color="#bb9af7" stop-opacity="0.08"/>
+      <stop offset="1" stop-color="#7aa2f7" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="chevron" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#a8c4ff"/>
+      <stop offset="0.48" stop-color="#7aa2f7"/>
+      <stop offset="1" stop-color="#7dcfff"/>
+    </linearGradient>
+    <linearGradient id="cursor" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#d0b8ff"/>
+      <stop offset="0.55" stop-color="#bb9af7"/>
+      <stop offset="1" stop-color="#7aa2f7"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.26"/>
+      <stop offset="0.45" stop-color="#ffffff" stop-opacity="0.05"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.10"/>
+    </linearGradient>
+    <filter id="soft-glow" x="-45%" y="-45%" width="190%" height="190%">
+      <feGaussianBlur stdDeviation="30"/>
+    </filter>
+  </defs>
+
+  <!-- App tile: 824px with the standard macOS margin. -->
+  <rect x="100" y="100" width="824" height="824" rx="188" fill="url(#tile)"/>
+  <rect x="100" y="100" width="824" height="824" rx="188" fill="url(#glow)"/>
+
+  <!-- A faint command-line baseline anchors the glyph. -->
+  <rect x="272" y="720" width="480" height="8" rx="4" fill="#7aa2f7" opacity="0.20"/>
+
+  <!-- Soft aura behind the prompt. -->
+  <g filter="url(#soft-glow)" opacity="0.60">
+    <path d="M350 350 L500 512 L350 674" fill="none" stroke="#7aa2f7"
+          stroke-width="88" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="585" y="380" width="90" height="264" rx="36" fill="#bb9af7"/>
+  </g>
+
+  <!-- Prompt chevron plus block cursor. -->
+  <path d="M350 350 L500 512 L350 674" fill="none" stroke="url(#chevron)"
+        stroke-width="88" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="585" y="380" width="90" height="264" rx="36" fill="url(#cursor)"/>
+
+  <!-- Glassy rim and a restrained top highlight. -->
+  <rect x="101" y="101" width="822" height="822" rx="187" fill="none"
+        stroke="url(#rim)" stroke-width="4"/>
+  <rect x="138" y="128" width="748" height="3" rx="1.5" fill="#ffffff" opacity="0.16"/>
+</svg>

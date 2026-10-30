@@ -8,6 +8,8 @@
 	<string>Prompt</string>
 	<key>CFBundleExecutable</key>
 	<string>prompt</string>
+	<key>CFBundleIconFile</key>
+	<string>Prompt</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.pauloms.prompt</string>
 	<key>CFBundleInfoDictionaryVersion</key>

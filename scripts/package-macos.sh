@@ -48,6 +48,7 @@ install -m 0755 "$BIN" "$APP/Contents/MacOS/prompt"
 install -m 0644 "$ROOT/LICENSE" "$APP/Contents/Resources/LICENSE"
 install -m 0644 "$ROOT/THIRD_PARTY.md" "$APP/Contents/Resources/THIRD_PARTY.md"
 install -m 0644 "$ROOT/vendor/ghostty-vt/LICENSE" "$APP/Contents/Resources/GHOSTTY-LICENSE"
+install -m 0644 "$ROOT/packaging/macos/Prompt.icns" "$APP/Contents/Resources/Prompt.icns"
 
 sed \
   -e "s/__VERSION__/$VERSION/g" \

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/icon.svg" width="112" alt="Prompt icon">
+</p>
+
 # Prompt
 
 **A terminal that types like an editor.**
