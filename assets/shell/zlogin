@@ -1,0 +1,4 @@
+# Prompt's managed zlogin. Preserve the user's login-shell configuration.
+if [[ -n "${PROMPT_USER_ZDOTDIR:-}" && -f "${PROMPT_USER_ZDOTDIR}/.zlogin" ]]; then
+  builtin source "${PROMPT_USER_ZDOTDIR}/.zlogin"
+fi

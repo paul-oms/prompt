@@ -1,0 +1,8 @@
+# Prompt's managed bash rc. Sources your normal configuration, then installs
+# the prompt markers Prompt uses.
+_prompt_shim_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -n "${PROMPT_USER_HOME:-}" && -f "${PROMPT_USER_HOME}/.bashrc" ]]; then
+  . "${PROMPT_USER_HOME}/.bashrc"
+fi
+. "${_prompt_shim_dir}/../prompt.bash"
+unset _prompt_shim_dir

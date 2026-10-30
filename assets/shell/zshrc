@@ -1,0 +1,13 @@
+# Prompt's managed zsh rc. Sources your normal configuration, then installs
+# the prompt markers Prompt uses.
+typeset -g _prompt_shim_dir="${${(%):-%x}:A:h}"
+if [[ -n "${PROMPT_USER_ZDOTDIR:-}" && -f "${PROMPT_USER_ZDOTDIR}/.zshrc" ]]; then
+  builtin source "${PROMPT_USER_ZDOTDIR}/.zshrc"
+fi
+builtin source "${_prompt_shim_dir:h}/prompt.zsh"
+# Our shim has been loaded; restore the user's ZDOTDIR so tools such as
+# powerlevel10k find their config relative to the directory the user expects.
+if [[ -n "${PROMPT_USER_ZDOTDIR:-}" ]]; then
+  export ZDOTDIR="${PROMPT_USER_ZDOTDIR}"
+fi
+unset _prompt_shim_dir

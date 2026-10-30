@@ -1,0 +1,23 @@
+# Prompt's managed zshenv. Keeps the user's environment setup working even
+# though ZDOTDIR points at Prompt's shim directory.
+# When Prompt ships its own zsh, point module/function loading at the bundled
+# prefix instead of the build machine's paths.
+if [[ -n "${PROMPT_ZSH_PREFIX:-}" ]]; then
+  if [[ -d "${PROMPT_ZSH_PREFIX}/lib/zsh" ]]; then
+    module_path=("${PROMPT_ZSH_PREFIX}"/lib/zsh/*(N/) $module_path)
+  fi
+  if [[ -d "${PROMPT_ZSH_PREFIX}/share/zsh/functions" ]]; then
+    fpath=("${PROMPT_ZSH_PREFIX}"/share/zsh/functions/*(N/) $fpath)
+  fi
+  if [[ -d "${PROMPT_ZSH_PREFIX}/share/zsh/site-functions" ]]; then
+    fpath=("${PROMPT_ZSH_PREFIX}/share/zsh/site-functions" $fpath)
+  fi
+fi
+if [[ -n "${PROMPT_USER_ZDOTDIR:-}" && -f "${PROMPT_USER_ZDOTDIR}/.zshenv" ]]; then
+  builtin source "${PROMPT_USER_ZDOTDIR}/.zshenv"
+fi
+# If the user's zshenv changed ZDOTDIR, bring it back to our shim so the rc
+# below (and Prompt's integration) is still loaded.
+if [[ -n "${PROMPT_ZDOTDIR:-}" ]]; then
+  export ZDOTDIR="${PROMPT_ZDOTDIR}"
+fi

@@ -1,0 +1,9 @@
+Library: libghostty-vt (Ghostty's embeddable VT core)
+Source: https://github.com/ghostty-org/ghostty
+Ref: main @ cf0ab14aed55 (2026-10-30)
+Zig: 0.17.0
+Build: zig build -Demit-lib-vt -Doptimize=ReleaseFast
+Host: Linux/x86_64
+Built: 2026-10-30
+
+Rebuild for your platform with scripts/build-ghostty-vt.sh.

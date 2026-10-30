@@ -1,0 +1,31 @@
+[package]
+name = "prompt"
+version = "0.1.0"
+edition = "2021"
+description = "Prompt — a terminal with an editor-grade command line"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+arboard = "3"
+cosmic-text = "0.19"
+dirs = "7"
+portable-pty = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+softbuffer = "0.4"
+tiny-skia = { version = "0.12", features = ["png-format"] }
+toml = "1"
+unicode-segmentation = "1"
+unicode-width = "0.2"
+winit = "0.30"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

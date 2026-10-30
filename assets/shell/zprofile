@@ -1,0 +1,5 @@
+# Prompt's managed zprofile. Prompt launches a login zsh so macOS gets the
+# same environment setup as Terminal.app/iTerm; source the user's profile.
+if [[ -n "${PROMPT_USER_ZDOTDIR:-}" && -f "${PROMPT_USER_ZDOTDIR}/.zprofile" ]]; then
+  builtin source "${PROMPT_USER_ZDOTDIR}/.zprofile"
+fi
