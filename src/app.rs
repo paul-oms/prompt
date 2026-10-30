@@ -106,6 +106,8 @@ struct BackgroundTab {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct PanelEntry {
+    /// Index into `PromptApp::background`.
+    tab: usize,
     y: f32,
     h: f32,
     close: Option<(f32, f32, f32, f32)>,
@@ -171,6 +173,8 @@ pub struct PromptApp {
     /// Tabs detached to the background panel. Their shells keep running.
     background: Vec<BackgroundTab>,
     panel: PanelLayout,
+    /// First background-tab row shown in the panel.
+    panel_scroll: usize,
     detach_rect: Option<(f32, f32, f32, f32)>,
     block_view: Option<BlockView>,
     pending_highlight: Option<(u64, u16, u16)>,
@@ -296,6 +300,7 @@ impl PromptApp {
             blocks: Vec::new(),
             background: Vec::new(),
             panel: PanelLayout::default(),
+            panel_scroll: 0,
             detach_rect: None,
             block_view: None,
             pending_highlight: None,
@@ -613,6 +618,7 @@ impl PromptApp {
             h: (h - margin * 2.0).max(1.0),
             entries: Vec::new(),
         };
+        self.panel_scroll = self.panel_scroll.min(self.panel_scroll_range().1);
 
         let grid_x = margin + padding;
         let grid_y = margin + padding;
@@ -2629,14 +2635,14 @@ impl PromptApp {
             self.search = None;
         }
         if state == ElementState::Pressed && self.mouse_in_panel(x, y) {
-            if let Some(index) = self.panel_entry_at(x, y) {
-                if let Some((cx, cy, cw, ch)) = self.panel.entries[index].close {
+            if let Some(entry) = self.panel_entry_at(x, y) {
+                if let Some((cx, cy, cw, ch)) = entry.close {
                     if x >= cx && x < cx + cw && y >= cy && y < cy + ch {
-                        self.kill_background(index);
+                        self.kill_background(entry.tab);
                         return;
                     }
                 }
-                self.attach_background(index);
+                self.attach_background(entry.tab);
             }
             return;
         }
@@ -2770,6 +2776,10 @@ impl PromptApp {
         };
         let x = pos.x as f32;
         let y = pos.y as f32;
+        if self.mouse_in_panel(x, y) {
+            self.scroll_panel(lines.round() as i64);
+            return;
+        }
         if self.block_view.is_some() && (self.mouse_in_grid(x, y) || self.mouse_in_card(x, y)) {
             self.scroll_block(lines.round() as i64);
             return;
@@ -2826,11 +2836,41 @@ impl PromptApp {
             && y < self.panel.y + self.panel.h
     }
 
-    fn panel_entry_at(&self, x: f32, y: f32) -> Option<usize> {
+    /// Number of background-tab rows the panel can show and the largest valid
+    /// first-row offset. Kept in one place so drawing and wheel scrolling agree.
+    fn panel_scroll_range(&self) -> (usize, usize) {
+        let pad = self.s(10.0);
+        let gap = self.s(8.0);
+        let entry_h = pad * 2.0 + self.text.cell_h * 3.0 + self.s(4.0);
+        let top = self.panel.y + pad + self.text.cell_h + gap;
+        let bottom = self.panel.y + self.panel.h - pad;
+        let visible = if self.panel.w <= 0.0 || bottom - top < entry_h {
+            0
+        } else {
+            (((bottom - top - entry_h) / (entry_h + gap)).floor() as usize) + 1
+        };
+        let max_scroll = if visible == 0 {
+            0
+        } else {
+            self.background.len().saturating_sub(visible)
+        };
+        (visible, max_scroll)
+    }
+
+    fn scroll_panel(&mut self, lines: i64) {
+        let (_, max_scroll) = self.panel_scroll_range();
+        let next = (self.panel_scroll as i64 + lines).clamp(0, max_scroll as i64) as usize;
+        if next != self.panel_scroll {
+            self.panel_scroll = next;
+            self.request_redraw();
+        }
+    }
+
+    fn panel_entry_at(&self, x: f32, y: f32) -> Option<PanelEntry> {
         if !self.mouse_in_panel(x, y) {
             return None;
         }
-        self.panel.entries.iter().position(|entry| {
+        self.panel.entries.iter().copied().find(|entry| {
             y >= entry.y
                 && y < entry.y + entry.h
                 && x >= self.panel.x
@@ -3920,6 +3960,11 @@ impl PromptApp {
             })
             .collect();
 
+        let (visible, max_scroll) = self.panel_scroll_range();
+        self.panel_scroll = self.panel_scroll.min(max_scroll);
+        let first = self.panel_scroll;
+        let total = rows.len();
+
         let Some(canvas) = self.canvas.as_mut() else {
             return;
         };
@@ -3970,9 +4015,12 @@ impl PromptApp {
         );
 
         let mut entries = Vec::new();
-        let mut y = panel.y + pad + cell_h + s(8.0);
+        let list_top = panel.y + pad + cell_h + s(8.0);
+        let mut y = list_top;
         let bottom = panel.y + panel.h - pad;
-        for (command, status, color, log, running) in rows {
+        for (index, (command, status, color, log, running)) in
+            rows.into_iter().enumerate().skip(first)
+        {
             if y + entry_h > bottom {
                 break;
             }
@@ -4040,11 +4088,39 @@ impl PromptApp {
             );
 
             entries.push(PanelEntry {
+                tab: index,
                 y,
                 h: entry_h,
                 close: Some((cx, cy, close, close)),
             });
             y += entry_h + s(8.0);
+        }
+        if max_scroll > 0 && visible > 0 {
+            let track_h = bottom - list_top;
+            let track_x = panel.x + panel.w - s(5.0);
+            let track_w = s(3.0);
+            painter.rounded(
+                track_x,
+                list_top,
+                track_w,
+                track_h,
+                track_w / 2.0,
+                theme.border,
+                0.35,
+            );
+            let thumb_h = (track_h * visible as f32 / total as f32)
+                .max(s(24.0))
+                .min(track_h);
+            let progress = first as f32 / max_scroll as f32;
+            painter.rounded(
+                track_x,
+                list_top + (track_h - thumb_h) * progress,
+                track_w,
+                thumb_h,
+                track_w / 2.0,
+                theme.dim,
+                0.65,
+            );
         }
         drop(painter);
         self.panel.entries = entries;

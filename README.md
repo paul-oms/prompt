@@ -42,8 +42,9 @@ launch, right-click **Prompt.app**, choose **Open**, then confirm.
   demand, `g`/`G` snaps to the top or bottom, and `/` searches the block.
 - **Background commands** — push a long-running command into the side panel
   with the card's **background** button or `Cmd/Ctrl+Shift+D`. The panel shows
-  the command, its elapsed time and last output line; click the entry to bring
-  it back, or the **×** to stop it.
+  the command, its elapsed time and last output line; scroll the list with the
+  mouse wheel when there are more tabs than fit. Click the entry to bring it
+  back, or the **×** to stop it.
 - **Ghost autocomplete** — dim suggestions from history and `PATH` appear as
   you type; `Right` at the end of the line accepts them. `Tab` completes the
   token, or opens the full completion popup when several candidates match;
