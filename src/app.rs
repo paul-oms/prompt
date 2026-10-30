@@ -201,6 +201,8 @@ pub struct PromptApp {
     card: CardLayout,
     hscroll: usize,
     composer_scroll: usize,
+    /// Composer line count the current grid/card layout was built for.
+    layout_composer_lines: usize,
 
     history_index: Option<usize>,
     history_draft: String,
@@ -217,6 +219,10 @@ pub struct PromptApp {
 
     cursor_on: bool,
     last_blink: Instant,
+
+    /// Input tracing for debugging hit-testing (`PROMPT_TRACE_INPUT=1`).
+    trace_input: bool,
+    trace_zone: u8,
 
     sel_anchor: Option<(u16, u16)>,
     sel_drag: bool,
@@ -328,6 +334,7 @@ impl PromptApp {
             card: CardLayout::default(),
             hscroll: 0,
             composer_scroll: 0,
+            layout_composer_lines: 1,
             history_index: None,
             history_draft: String::new(),
             search: None,
@@ -338,6 +345,8 @@ impl PromptApp {
             dock_started: None,
             cursor_on: true,
             last_blink: started,
+            trace_input: std::env::var_os("PROMPT_TRACE_INPUT").is_some(),
+            trace_zone: 0,
             sel_anchor: None,
             sel_drag: false,
             click_count: 0,
@@ -599,7 +608,10 @@ impl PromptApp {
         } else {
             0.0
         };
-        let base_card = self.s(12.0) * 2.0 + self.text.cell_h + self.s(6.0) + hint_h;
+        let composer_lines = self.composer_lines() as f32;
+        let base_card =
+            self.s(12.0) * 2.0 + composer_lines * self.text.cell_h + self.s(6.0) + hint_h;
+        self.layout_composer_lines = self.composer_lines();
 
         // A detached tab gets a rail on the right; the terminal and composer
         // share the remaining width.
@@ -802,6 +814,7 @@ impl PromptApp {
                     self.history_index = None;
                     self.completion_popup = None;
                     self.editor.clear_selection();
+                    self.trace("event PromptStart (focus=composer, composer selection cleared)");
                 }
                 TermEvent::InputStart => {}
                 TermEvent::OutputStart { command } => {
@@ -1693,6 +1706,15 @@ impl PromptApp {
         let alt = mods.alt_key();
         let ctrl = mods.control_key();
 
+        if self.trace_input {
+            if let PhysicalKey::Code(code) = event.physical_key {
+                self.trace(format!(
+                    "key {:?} primary={} shift={} ctrl={} alt={} mode={:?} focus={:?}",
+                    code, primary, shift, ctrl, alt, self.mode, self.focus
+                ));
+            }
+        }
+
         if let PhysicalKey::Code(code) = event.physical_key {
             if code == KeyCode::F11 || (keys::is_macos() && primary && code == KeyCode::KeyF) {
                 if let Some(window) = &self.window {
@@ -1842,12 +1864,17 @@ impl PromptApp {
                     return true;
                 }
                 KeyCode::KeyA => {
-                    if self.focus == Focus::Grid {
+                    // In the composer, Ctrl+A means "select the command I'm
+                    // editing". Only fall back to selecting the scrollback when
+                    // the composer is empty, so output can still be copied.
+                    if self.focus == Focus::Grid && self.editor.is_empty() {
+                        self.trace("ctrl+a -> terminal select_all (composer empty)");
                         if let Some(session) = &mut self.session {
                             session.select_all();
                         }
                         self.grid_dirty = true;
                     } else {
+                        self.trace("ctrl+a -> composer select_all");
                         self.editor.select_all();
                         self.focus = Focus::Composer;
                     }
@@ -2120,6 +2147,23 @@ impl PromptApp {
         false
     }
 
+    /// Number of composer lines currently on screen (1 when it is inactive).
+    fn composer_lines(&self) -> usize {
+        if self.block_view.is_some() || self.mode != Mode::Compose {
+            1
+        } else {
+            self.editor.line_count().clamp(1, 10)
+        }
+    }
+
+    /// Keep the grid out of the composer's way when a multi-line command is
+    /// being edited. Cheap no-op unless the line count actually changed.
+    fn sync_composer_layout(&mut self) {
+        if self.layout_composer_lines != self.composer_lines() {
+            self.relayout();
+        }
+    }
+
     fn after_edit(&mut self) {
         self.focus = Focus::Composer;
         self.completion_popup = None;
@@ -2139,6 +2183,7 @@ impl PromptApp {
             }
         }
         self.composer_scroll_to_caret();
+        self.sync_composer_layout();
         self.request_redraw();
     }
 
@@ -2147,6 +2192,7 @@ impl PromptApp {
         self.cursor_on = true;
         self.last_blink = Instant::now();
         self.composer_scroll_to_caret();
+        self.sync_composer_layout();
         self.request_redraw();
     }
 
@@ -2239,6 +2285,7 @@ impl PromptApp {
         self.sel_anchor = None;
         self.sel_drag = false;
         self.toast = None;
+        self.sync_composer_layout();
         self.request_redraw();
     }
 
@@ -2621,6 +2668,53 @@ impl PromptApp {
 
     // ---- mouse ------------------------------------------------------------
 
+    /// Debug aid: `PROMPT_TRACE_INPUT=1` logs pointer and key handling to
+    /// stderr so hit-testing problems can be diagnosed from a real session.
+    fn trace(&self, msg: impl AsRef<str>) {
+        if self.trace_input {
+            eprintln!("[prompt] {}", msg.as_ref());
+        }
+    }
+
+    fn trace_geometry(&self) -> String {
+        format!(
+            "size={}x{} scale={:.2} card=({:.0},{:.0},{:.0},{:.0}) text=({:.0},{:.0}) grid=({:.0},{:.0},{:.0},{:.0}) dock={:.3} mode={:?} focus={:?} tracking={} panel_w={:.0}",
+            self.size.width,
+            self.size.height,
+            self.scale,
+            self.card.x,
+            self.card.y,
+            self.card.w,
+            self.card.h,
+            self.card.text_x,
+            self.card.text_y,
+            self.grid.x,
+            self.grid.y,
+            self.grid.w,
+            self.grid.h,
+            self.dock_progress,
+            self.mode,
+            self.focus,
+            self.session
+                .as_ref()
+                .map(|s| s.mouse_tracking())
+                .unwrap_or(false),
+            self.panel.w,
+        )
+    }
+
+    fn zone_at(&self, x: f32, y: f32) -> &'static str {
+        if self.mouse_in_panel(x, y) {
+            "panel"
+        } else if self.mouse_in_grid(x, y) {
+            "grid"
+        } else if self.mouse_in_card(x, y) {
+            "card"
+        } else {
+            "none"
+        }
+    }
+
     fn handle_mouse_button(
         &mut self,
         state: ElementState,
@@ -2629,6 +2723,15 @@ impl PromptApp {
     ) {
         let x = pos.x as f32;
         let y = pos.y as f32;
+        self.trace(format!(
+            "button {:?} {:?} at ({:.1},{:.1}) zone={} {}",
+            state,
+            button,
+            x,
+            y,
+            self.zone_at(x, y),
+            self.trace_geometry()
+        ));
         if state == ElementState::Pressed {
             // A click outside a popup is a dismissal in every editor.
             self.completion_popup = None;
@@ -2646,8 +2749,61 @@ impl PromptApp {
             }
             return;
         }
-        if self.mouse_in_grid(x, y) {
+        // The composer is checked before the terminal: a multi-line composer
+        // grows upwards over the top of the grid, and clicks on those lines
+        // belong to the editor, not to the scrollback behind it.
+        if self.mouse_in_card(x, y) {
+            if self.block_view.is_some() {
+                self.close_block_view();
+            }
+            self.focus = Focus::Composer;
+            if let Some(session) = &mut self.session {
+                session.clear_selection();
+            }
+            self.grid_dirty = true;
+            if state == ElementState::Pressed {
+                if self.mode == Mode::Running {
+                    if let Some((bx, by, bw, bh)) = self.detach_rect {
+                        if x >= bx && x < bx + bw && y >= by && y < by + bh {
+                            self.detach_running();
+                            return;
+                        }
+                    }
+                }
+                let count = self.next_click_count(x, y);
+                if let Some(index) = self.card_index(x, y) {
+                    self.trace(format!(
+                        "click in card -> focus=Composer line/col={:?} index={} clicks={}",
+                        self.card_line_col(x, y),
+                        index,
+                        count
+                    ));
+                    if count == 2 {
+                        self.editor.select_word_at(index);
+                    } else if count >= 3 {
+                        self.editor.select_line_at(index);
+                    } else {
+                        let (line, col) = self.card_line_col(x, y);
+                        let extend = self.modifiers.shift_key();
+                        self.editor.index_for_line_col(line, col, extend);
+                    }
+                    self.sel_drag = true;
+                    self.history_index = None;
+                } else {
+                    self.trace(format!(
+                        "click in card but no index line/col={:?}",
+                        self.card_line_col(x, y)
+                    ));
+                }
+            } else {
+                self.sel_drag = false;
+            }
+            self.request_redraw();
+        } else if self.mouse_in_grid(x, y) {
             self.focus = Focus::Grid;
+            if state == ElementState::Pressed {
+                self.trace("click in grid -> focus=Grid");
+            }
             if self.should_forward_mouse(button) {
                 self.forward_mouse(button, state, x, y, false);
                 return;
@@ -2681,42 +2837,6 @@ impl PromptApp {
                 }
                 self.request_redraw();
             }
-        } else if self.mouse_in_card(x, y) {
-            if self.block_view.is_some() {
-                self.close_block_view();
-            }
-            self.focus = Focus::Composer;
-            if let Some(session) = &mut self.session {
-                session.clear_selection();
-            }
-            self.grid_dirty = true;
-            if state == ElementState::Pressed {
-                if self.mode == Mode::Running {
-                    if let Some((bx, by, bw, bh)) = self.detach_rect {
-                        if x >= bx && x < bx + bw && y >= by && y < by + bh {
-                            self.detach_running();
-                            return;
-                        }
-                    }
-                }
-                let count = self.next_click_count(x, y);
-                if let Some(index) = self.card_index(x, y) {
-                    if count == 2 {
-                        self.editor.select_word_at(index);
-                    } else if count >= 3 {
-                        self.editor.select_line_at(index);
-                    } else {
-                        let (line, col) = self.card_line_col(x, y);
-                        let extend = self.modifiers.shift_key();
-                        self.editor.index_for_line_col(line, col, extend);
-                    }
-                    self.sel_drag = true;
-                    self.history_index = None;
-                }
-            } else {
-                self.sel_drag = false;
-            }
-            self.request_redraw();
         }
     }
 
@@ -2733,7 +2853,30 @@ impl PromptApp {
     fn handle_cursor_moved(&mut self, pos: PhysicalPosition<f64>) {
         let x = pos.x as f32;
         let y = pos.y as f32;
+        let zone = self.zone_at(x, y);
+        let zone_id = match zone {
+            "panel" => 1,
+            "grid" => 2,
+            "card" => 3,
+            _ => 0,
+        };
+        if zone_id != self.trace_zone {
+            self.trace_zone = zone_id;
+            self.trace(format!(
+                "hover -> {} at ({:.1},{:.1}) {}",
+                zone,
+                x,
+                y,
+                self.trace_geometry()
+            ));
+        }
         if self.sel_drag {
+            self.trace(format!(
+                "drag at ({:.1},{:.1}) zone={}",
+                x,
+                y,
+                self.zone_at(x, y)
+            ));
             if self.mouse_in_grid(x, y) {
                 if let Some((cx, cy)) = self.viewport_cell(x, y) {
                     if let Some(anchor) = self.sel_anchor {
@@ -2891,8 +3034,12 @@ impl PromptApp {
     }
 
     fn card_line_col(&self, x: f32, y: f32) -> (usize, usize) {
-        let line = ((y - self.card.text_y) / self.text.cell_h).floor().max(0.0) as usize
-            + self.composer_scroll;
+        let last_line = self.editor.line_count().saturating_sub(1);
+        // Clamp to the text: clicks in the card's padding or on the hint row
+        // should still land on the nearest line instead of being ignored.
+        let line = (((y - self.card.text_y) / self.text.cell_h).floor().max(0.0) as usize
+            + self.composer_scroll)
+            .min(last_line);
         let col =
             ((x - self.card.text_x) / self.text.cell_w).floor().max(0.0) as usize + self.hscroll;
         (line, col)
