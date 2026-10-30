@@ -35,6 +35,13 @@ launch, right-click **Prompt.app**, choose **Open**, then confirm.
 - **Real terminal behaviour** — vim/nvim, less, top, ssh, tmux and other
   full-screen programs get the keyboard while they run. Prompt switches back
   to the composer when the shell prompt returns.
+- **Command blocks** — every submitted command is marked in the scrollback
+  with its exit status. Scroll through earlier commands, or jump between
+  blocks with `Cmd/Ctrl+Shift+↑/↓`.
+- **Background commands** — push a long-running command into the side panel
+  with the card's **background** button or `Cmd/Ctrl+Shift+D`. The panel shows
+  the command, its elapsed time and last output line; click the entry to bring
+  it back, or the **×** to stop it.
 - **Ghost autocomplete** — dim suggestions from history and `PATH` appear as
   you type; `Tab` (or `Right` at the end of the line) accepts them. `Tab` with
   no suggestion opens the full completion popup.
@@ -134,6 +141,8 @@ Prompt is designed for both macOS and Linux. `Cmd` means `Cmd` on macOS and
 | Interrupt / clear line | `Ctrl+C` | `Ctrl+C` |
 | Clear screen | `Cmd+K` | `Ctrl+L` |
 | Scroll terminal | `Shift+PageUp/Down`, wheel | same |
+| Previous / next command block | `Cmd+Shift+↑/↓` | `Ctrl+Shift+↑/↓` |
+| Move running command to background | `Cmd+Shift+D` | `Ctrl+Shift+D` |
 | Fullscreen | `F11`, `Cmd+Ctrl+F` | `F11` |
 | Zoom font | `Cmd+=` / `Cmd+-` / `Cmd+0` | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
 

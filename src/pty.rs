@@ -153,14 +153,27 @@ impl Pty {
             }
         }
     }
+
+    /// Stop the shell *and* the job it is currently running. The shell alone
+    /// often leaves a foreground child alive, which then holds the slave end of
+    /// the pty open.
+    pub fn terminate(&mut self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.master.process_group_leader() {
+            unsafe {
+                libc::kill(-pgid, libc::SIGHUP);
+            }
+        }
+        let _ = self.killer.kill();
+    }
 }
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        let _ = self.killer.kill();
-        if let Some(handle) = self.reader.take() {
-            let _ = handle.join();
-        }
+        self.terminate();
+        // Never join the reader thread: a child that ignores SIGHUP would block
+        // it forever and freeze the UI. Detaching lets it exit on its own.
+        self.reader.take();
     }
 }
 

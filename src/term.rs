@@ -495,6 +495,17 @@ impl TerminalSession {
         self.dirty = true;
     }
 
+    /// Scroll so `row` (an absolute scrollback row) is the first visible row.
+    pub fn scroll_to_row(&mut self, row: u64) {
+        let mut viewport: ffi::GhosttyTerminalScrollViewport = unsafe { std::mem::zeroed() };
+        viewport.tag = ffi::GHOSTTY_SCROLL_VIEWPORT_ROW;
+        viewport.value.row = row as usize;
+        unsafe {
+            ffi::ghostty_terminal_scroll_viewport(self.term, viewport);
+        }
+        self.dirty = true;
+    }
+
     pub fn scrollbar(&self) -> Scrollbar {
         let mut sb: ffi::GhosttyTerminalScrollbar = unsafe { std::mem::zeroed() };
         let result = unsafe {
@@ -959,32 +970,79 @@ impl TerminalSession {
         }
     }
 
+    /// Plain text of the last row with content in the viewport. Used by the
+    /// background-command panel while a command is running.
+    pub fn last_line(&self) -> String {
+        for row in self.frame.rows_view.iter().rev() {
+            let text = row_text(row);
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        String::new()
+    }
+
+    /// Like `last_line`, but ignores the cursor row so a finished command shows
+    /// its last output instead of the shell prompt printed below it.
+    pub fn last_line_before_cursor(&self) -> String {
+        let cursor = self.frame.cursor.map(|c| c.y).unwrap_or(0);
+        for row in self.frame.rows_view.iter().rev() {
+            if row.y >= cursor {
+                continue;
+            }
+            let text = row_text(row);
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        String::new()
+    }
+
     /// Plain text of the whole visible screen. Used by tests and diagnostics.
     #[allow(dead_code)]
     pub fn visible_text(&self) -> String {
         let mut out = String::new();
         for line in &self.frame.rows_view {
-            let mut wide_pending = false;
-            for cell in &line.cells {
-                if cell.len == 0 {
-                    if wide_pending {
-                        wide_pending = false;
-                        continue;
-                    }
-                    out.push(' ');
-                    continue;
-                }
-                let text = cell.text();
-                wide_pending = unicode_width::UnicodeWidthStr::width(text.as_str()) >= 2;
-                out.push_str(&text);
+            let mut text = row_text(line);
+            while text.ends_with(' ') {
+                text.pop();
             }
-            while out.ends_with(' ') {
-                out.pop();
-            }
+            out.push_str(&text);
             out.push('\n');
         }
         out
     }
+}
+
+impl Frame {
+    /// Plain text of one viewport row, or `None` when the row is not present.
+    pub fn row_text(&self, viewport_y: u16) -> Option<String> {
+        self.rows_view
+            .iter()
+            .find(|row| row.y == viewport_y)
+            .map(row_text)
+    }
+}
+
+fn row_text(row: &RowView) -> String {
+    let mut text = String::new();
+    let mut wide_pending = false;
+    for cell in &row.cells {
+        if cell.len == 0 {
+            if wide_pending {
+                wide_pending = false;
+            } else {
+                text.push(' ');
+            }
+            continue;
+        }
+        let cell_text = cell.text();
+        wide_pending = unicode_width::UnicodeWidthStr::width(cell_text.as_str()) >= 2;
+        text.push_str(&cell_text);
+    }
+    text
 }
 
 pub fn mode_pack(value: u16, ansi: bool) -> ffi::GhosttyMode {
@@ -1060,6 +1118,39 @@ mod tests {
         assert!(text.starts_with("alpha beta"), "{text:?}");
         term.clear_selection();
         assert!(!term.has_selection());
+    }
+
+    #[test]
+    fn last_line_reports_the_newest_content() {
+        let mut term = session();
+        term.write(b"first\r\nsecond\r\nthird\r\n");
+        term.update_frame();
+        assert_eq!(term.last_line(), "third");
+        term.write(b"\r\n");
+        term.update_frame();
+        assert_eq!(term.last_line(), "third");
+    }
+
+    #[test]
+    fn scroll_to_row_round_trips_with_the_scrollbar() {
+        let mut term = session();
+        for i in 0..40 {
+            term.write(format!("line {i}\r\n").as_bytes());
+        }
+        term.update_frame();
+        let total = term.scrollbar().total;
+        term.scroll_to_row(total.saturating_sub(12));
+        term.update_frame();
+        let offset = term.scrollbar().offset;
+        assert!(offset > 0, "expected scrollback, offset was {offset}");
+        assert!(
+            term.visible_text().contains("line"),
+            "{}",
+            term.visible_text()
+        );
+        term.scroll_to_bottom();
+        term.update_frame();
+        assert!(term.scrollbar().at_bottom());
     }
 
     #[test]

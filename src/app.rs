@@ -75,6 +75,49 @@ struct Toast {
     until: Instant,
 }
 
+/// One command's place in the terminal's scrollback. Rows are absolute, i.e.
+/// scrollback rows counted from the start of the session, so they stay valid
+/// while the viewport scrolls.
+struct Block {
+    command: String,
+    /// First output row of the command.
+    start_row: u64,
+    /// Last output row, once the command has finished.
+    end_row: Option<u64>,
+    status: Option<i32>,
+}
+
+/// A detached tab: its shell (and any running command) keeps living while the
+/// tab sits in the background panel.
+struct BackgroundTab {
+    session: TerminalSession,
+    pty: Pty,
+    mode: Mode,
+    command: String,
+    started: Instant,
+    duration: Option<Duration>,
+    exit: Option<i32>,
+    cwd: PathBuf,
+    last_line: String,
+    blocks: Vec<Block>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PanelEntry {
+    y: f32,
+    h: f32,
+    close: Option<(f32, f32, f32, f32)>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PanelLayout {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    entries: Vec<PanelEntry>,
+}
+
 pub struct PromptApp {
     paths: Paths,
     config: Config,
@@ -95,6 +138,12 @@ pub struct PromptApp {
 
     session: Option<TerminalSession>,
     pty: Option<Pty>,
+    /// Commands run in the foreground tab, for block chrome.
+    blocks: Vec<Block>,
+    /// Tabs detached to the background panel. Their shells keep running.
+    background: Vec<BackgroundTab>,
+    panel: PanelLayout,
+    detach_rect: Option<(f32, f32, f32, f32)>,
     editor: Editor,
     history: History,
     completion: CompletionEngine,
@@ -214,6 +263,10 @@ impl PromptApp {
             scale: 1.0,
             session: None,
             pty: None,
+            blocks: Vec::new(),
+            background: Vec::new(),
+            panel: PanelLayout::default(),
+            detach_rect: None,
             editor: Editor::default(),
             history,
             completion: CompletionEngine::new(),
@@ -370,6 +423,21 @@ impl PromptApp {
         self.size = self.window.as_ref().unwrap().inner_size();
 
         self.relayout();
+        let cwd = self.cwd.clone();
+        self.spawn_foreground(cwd)?;
+        if self.config.ui.start_maximized {
+            if let Some(window) = &self.window {
+                window.set_maximized(true);
+            }
+        }
+        config::mark_started(&self.paths);
+        self.request_redraw();
+        Ok(())
+    }
+
+    /// Create the shell for the foreground tab. Used at startup and whenever a
+    /// running tab is detached or a background tab is attached.
+    fn spawn_foreground(&mut self, cwd: PathBuf) -> Result<()> {
         let cols = self.grid.cols;
         let rows = self.grid.rows;
         let cell_w = self.text.cell_w.max(1.0) as u32;
@@ -382,21 +450,14 @@ impl PromptApp {
             cell_h,
             self.config.behavior.scrollback_lines,
         )?;
-        self.session = Some(session);
-        let notify: Box<dyn Fn() + Send + Sync> = match self.proxy.clone() {
-            Some(proxy) => Box::new(move || {
-                let _ = proxy.send_event(());
-            }),
-            None => Box::new(|| {}),
-        };
         let pty = match Pty::spawn(
             &self.launch,
-            &self.cwd,
+            &cwd,
             cols,
             rows,
             cell_w,
             cell_h,
-            Some(notify),
+            self.pty_notify(),
         ) {
             Ok(pty) => pty,
             Err(first_error) => {
@@ -410,20 +471,14 @@ impl PromptApp {
                 self.launch.kind = ShellKind::Other;
                 self.launch.integrated = false;
                 self.launch.program = fallback.program.clone();
-                let notify: Box<dyn Fn() + Send + Sync> = match self.proxy.clone() {
-                    Some(proxy) => Box::new(move || {
-                        let _ = proxy.send_event(());
-                    }),
-                    None => Box::new(|| {}),
-                };
                 Pty::spawn(
                     &fallback,
-                    &self.cwd,
+                    &cwd,
                     cols,
                     rows,
                     cell_w,
                     cell_h,
-                    Some(notify),
+                    self.pty_notify(),
                 )
                 .map_err(|second| {
                     anyhow::anyhow!(
@@ -434,16 +489,40 @@ impl PromptApp {
                 })?
             }
         };
+        self.session = Some(session);
         self.pty = Some(pty);
+        self.cwd = cwd;
+        self.cwd_label.clear();
+        self.blocks.clear();
+        self.mode = if self.launch.integrated {
+            Mode::Compose
+        } else {
+            Mode::Direct
+        };
+        self.focus = Focus::Composer;
+        self.running_cmd.clear();
+        self.running_started = Instant::now();
+        self.last_status = None;
+        self.got_prompt = false;
+        self.exited = false;
+        self.sel_anchor = None;
+        self.sel_drag = false;
+        self.editor.clear();
+        self.hscroll = 0;
+        self.composer_scroll = 0;
         self.integration_deadline = Instant::now() + Duration::from_secs(4);
-        if self.config.ui.start_maximized {
-            if let Some(window) = &self.window {
-                window.set_maximized(true);
-            }
-        }
-        config::mark_started(&self.paths);
+        self.grid_dirty = true;
         self.request_redraw();
         Ok(())
+    }
+
+    fn pty_notify(&self) -> Option<Box<dyn Fn() + Send + Sync>> {
+        match self.proxy.clone() {
+            Some(proxy) => Some(Box::new(move || {
+                let _ = proxy.send_event(());
+            })),
+            None => Some(Box::new(|| {})),
+        }
     }
 
     fn relayout(&mut self) {
@@ -483,9 +562,27 @@ impl PromptApp {
         };
         let base_card = self.s(12.0) * 2.0 + self.text.cell_h + self.s(6.0) + hint_h;
 
+        // A detached tab gets a rail on the right; the terminal and composer
+        // share the remaining width.
+        let panel_w = if self.background.is_empty() {
+            0.0
+        } else {
+            (300.0 * scale)
+                .min((w * 0.38).max(220.0 * scale))
+                .min((w - 2.0 * self.s(14.0)).max(1.0))
+        };
+        let reserved = if panel_w > 0.0 { panel_w + gap } else { 0.0 };
+        self.panel = PanelLayout {
+            x: w - margin - panel_w,
+            y: margin,
+            w: panel_w,
+            h: (h - margin * 2.0).max(1.0),
+            entries: Vec::new(),
+        };
+
         let grid_x = margin + padding;
         let grid_y = margin + padding;
-        let grid_w = (w - 2.0 * grid_x).max(1.0);
+        let grid_w = (w - 2.0 * grid_x - reserved).max(1.0);
         let grid_h = (h - margin - base_card - gap - grid_y).max(1.0);
         let cols = ((grid_w / self.text.cell_w).floor() as u16).max(20);
         let rows = ((grid_h / self.text.cell_h).floor() as u16).max(5);
@@ -500,7 +597,7 @@ impl PromptApp {
         };
         self.card = CardLayout {
             x: margin,
-            w: (w - margin * 2.0).max(1.0),
+            w: (w - margin * 2.0 - reserved).max(1.0),
             h: base_card,
             y: h - margin - base_card,
             ..CardLayout::default()
@@ -529,6 +626,21 @@ impl PromptApp {
                     self.text.cell_h.max(1.0) as u32,
                 );
             }
+            // Detached commands should still see the current terminal size.
+            for tab in &mut self.background {
+                tab.session.resize(
+                    cols,
+                    rows,
+                    self.text.cell_w.max(1.0) as u32,
+                    self.text.cell_h.max(1.0) as u32,
+                );
+                tab.pty.resize(
+                    cols,
+                    rows,
+                    self.text.cell_w.max(1.0) as u32,
+                    self.text.cell_h.max(1.0) as u32,
+                );
+            }
         }
         self.grid_dirty = true;
         self.request_redraw();
@@ -537,22 +649,97 @@ impl PromptApp {
     // ---- event processing -------------------------------------------------
 
     fn drain_pty(&mut self) {
-        let Some(pty) = &mut self.pty else { return };
-        let data = pty.drain();
-        if !data.is_empty() {
-            if let Some(session) = &mut self.session {
-                let was_at_bottom = session.frame().scrollbar.at_bottom();
-                session.write(&data);
-                if was_at_bottom {
-                    session.scroll_to_bottom();
+        if let Some(pty) = &mut self.pty {
+            let data = pty.drain();
+            if !data.is_empty() {
+                if let Some(session) = &mut self.session {
+                    let was_at_bottom = session.frame().scrollbar.at_bottom();
+                    session.write(&data);
+                    if was_at_bottom {
+                        session.scroll_to_bottom();
+                    }
+                    let replies = session.take_pty_replies();
+                    if !replies.is_empty() {
+                        pty.write(&replies);
+                    }
+                    self.grid_dirty = true;
+                    self.after_terminal_change();
                 }
-                let replies = session.take_pty_replies();
-                if !replies.is_empty() {
-                    pty.write(&replies);
-                }
-                self.grid_dirty = true;
-                self.after_terminal_change();
             }
+        }
+        self.drain_background();
+    }
+
+    /// Keep detached shells alive and up to date, even though they are not
+    /// rendered in the grid.
+    fn drain_background(&mut self) {
+        let mut redraw = false;
+        for tab in &mut self.background {
+            let data = tab.pty.drain();
+            let mut changed = false;
+            if !data.is_empty() {
+                tab.session.write(&data);
+                let replies = tab.session.take_pty_replies();
+                if !replies.is_empty() {
+                    tab.pty.write(&replies);
+                }
+                changed = true;
+            }
+            for event in tab.session.drain_events() {
+                match event {
+                    TermEvent::PromptStart => {
+                        tab.mode = Mode::Compose;
+                        changed = true;
+                    }
+                    TermEvent::OutputStart { command } => {
+                        tab.mode = Mode::Running;
+                        tab.started = Instant::now();
+                        tab.duration = None;
+                        tab.exit = None;
+                        if !command.is_empty() {
+                            tab.command = command;
+                        }
+                        changed = true;
+                    }
+                    TermEvent::CommandEnd { exit_code } => {
+                        tab.mode = Mode::Compose;
+                        tab.duration = Some(tab.started.elapsed());
+                        if let Some(code) = exit_code {
+                            tab.exit = Some(code);
+                        }
+                        close_open_block(&mut tab.blocks, &mut tab.session, exit_code);
+                        changed = true;
+                    }
+                    TermEvent::InputStart => {}
+                    TermEvent::Bell => {
+                        // A bell from a background command is still worth
+                        // surfacing; the panel already shows the tab.
+                        changed = true;
+                    }
+                    TermEvent::TitleChanged | TermEvent::PwdChanged => {
+                        if let Some(pwd) = tab.session.pwd() {
+                            let path = pwd_to_path(&pwd);
+                            if path.is_dir() {
+                                tab.cwd = path;
+                            }
+                        }
+                        changed = true;
+                    }
+                }
+            }
+            if tab.mode == Mode::Compose && tab.duration.is_none() {
+                if let Some(code) = tab.pty.try_exit_code() {
+                    tab.exit = Some(code);
+                }
+            }
+            if changed {
+                tab.session.update_frame();
+                tab.last_line = panel_last_line(&tab.session, tab.mode);
+                redraw = true;
+            }
+        }
+        if redraw {
+            self.request_redraw();
         }
     }
 
@@ -583,13 +770,15 @@ impl PromptApp {
                     self.begin_dock();
                     self.running_started = Instant::now();
                     if !command.is_empty() {
-                        self.running_cmd = command;
+                        self.running_cmd = command.clone();
                     }
+                    self.note_output_start(command);
                 }
                 TermEvent::CommandEnd { exit_code } => {
                     if let Some(code) = exit_code {
                         self.last_status = Some((code, Instant::now()));
                     }
+                    self.end_block(exit_code);
                 }
                 TermEvent::Bell => {
                     self.toast("Bell");
@@ -618,6 +807,224 @@ impl PromptApp {
             }
         }
         self.grid_dirty = true;
+        self.request_redraw();
+    }
+
+    /// Absolute scrollback row of the cursor in the foreground session.
+    fn current_row(session: &mut TerminalSession) -> u64 {
+        session.update_frame();
+        let offset = session.scrollbar().offset;
+        let y = session.frame().cursor.map(|c| c.y as u64).unwrap_or(0);
+        offset + y
+    }
+
+    fn start_block(&mut self, command: String) {
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let row = Self::current_row(session);
+        let command = if command.is_empty() {
+            self.running_cmd.clone()
+        } else {
+            command
+        };
+        self.blocks.push(Block {
+            command,
+            start_row: row,
+            end_row: None,
+            status: None,
+        });
+        // Keep the chrome bounded for very long sessions.
+        if self.blocks.len() > 200 {
+            self.blocks.remove(0);
+        }
+        self.grid_dirty = true;
+    }
+
+    /// The shell reported that a command started. Commands submitted through
+    /// the composer already have a block (created at submit time); this also
+    /// covers commands started by other means, e.g. typed in classic input.
+    fn note_output_start(&mut self, command: String) {
+        if let Some(block) = self.blocks.last_mut() {
+            if block.end_row.is_none() {
+                if !command.is_empty() {
+                    block.command = command;
+                }
+                return;
+            }
+        }
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let row = Self::current_row(session).saturating_sub(1);
+        self.blocks.push(Block {
+            command,
+            start_row: row,
+            end_row: None,
+            status: None,
+        });
+        if self.blocks.len() > 200 {
+            self.blocks.remove(0);
+        }
+        self.grid_dirty = true;
+    }
+
+    /// Scroll to the previous/next command block and show which one it is.
+    fn jump_block(&mut self, direction: i32) {
+        let target = {
+            let Some(session) = &mut self.session else {
+                return;
+            };
+            session.update_frame();
+            let offset = session.scrollbar().offset;
+            let block = if direction < 0 {
+                self.blocks
+                    .iter()
+                    .rev()
+                    .find(|block| block.start_row < offset)
+            } else {
+                self.blocks.iter().find(|block| block.start_row > offset)
+            };
+            block.map(|block| (block.start_row, block.command.clone()))
+        };
+        let Some((row, command)) = target else { return };
+        if let Some(session) = &mut self.session {
+            session.scroll_to_row(row);
+            session.update_frame();
+        }
+        self.grid_dirty = true;
+        if command.is_empty() {
+            self.toast("Command block");
+        } else {
+            self.toast(command.replace('\n', " ⏎ "));
+        }
+        self.request_redraw();
+    }
+
+    fn end_block(&mut self, status: Option<i32>) {
+        if let Some(session) = &mut self.session {
+            close_open_block(&mut self.blocks, session, status);
+        }
+        self.grid_dirty = true;
+    }
+
+    // ---- background tabs --------------------------------------------------
+
+    /// Move the foreground shell into a background tab, keeping it alive.
+    fn take_foreground(&mut self) -> Option<BackgroundTab> {
+        let session = self.session.take()?;
+        let pty = self.pty.take()?;
+        let mode = self.mode;
+        let mut tab = BackgroundTab {
+            session,
+            pty,
+            mode,
+            command: self.running_cmd.clone(),
+            started: self.running_started,
+            duration: (mode != Mode::Running).then(|| self.running_started.elapsed()),
+            exit: None,
+            cwd: self.cwd.clone(),
+            last_line: String::new(),
+            blocks: std::mem::take(&mut self.blocks),
+        };
+        tab.session.scroll_to_bottom();
+        tab.session.update_frame();
+        tab.last_line = panel_last_line(&tab.session, mode);
+        Some(tab)
+    }
+
+    /// Move the running foreground tab into the background panel and open a
+    /// fresh shell at the same working directory.
+    fn detach_running(&mut self) {
+        if self.mode != Mode::Running {
+            self.toast("Nothing is running to move to the background");
+            return;
+        }
+        let Some(tab) = self.take_foreground() else {
+            return;
+        };
+        self.background.push(tab);
+        let cwd = self.cwd.clone();
+        if let Err(err) = self.spawn_foreground(cwd) {
+            self.toast(format!("Could not open a new shell: {err:#}"));
+        }
+        self.relayout();
+        self.toast("Moved to the background");
+        self.request_redraw();
+    }
+
+    /// Bring a background tab back to the foreground. An idle foreground shell
+    /// is discarded; a running one is swapped into the panel so nothing is lost.
+    fn attach_background(&mut self, index: usize) {
+        if index >= self.background.len() {
+            return;
+        }
+        let mut tab = self.background.remove(index);
+        if self.mode != Mode::Running && self.session.is_some() {
+            // Drop the idle foreground shell; its history is already saved.
+            self.session = None;
+            self.pty = None;
+            self.blocks.clear();
+        } else if let Some(current) = self.take_foreground() {
+            self.background.push(current);
+        }
+
+        tab.session.resize(
+            self.grid.cols,
+            self.grid.rows,
+            self.text.cell_w.max(1.0) as u32,
+            self.text.cell_h.max(1.0) as u32,
+        );
+        tab.pty.resize(
+            self.grid.cols,
+            self.grid.rows,
+            self.text.cell_w.max(1.0) as u32,
+            self.text.cell_h.max(1.0) as u32,
+        );
+        tab.session.update_frame();
+        if tab.mode != Mode::Running {
+            close_open_block(&mut tab.blocks, &mut tab.session, tab.exit);
+        }
+        self.session = Some(tab.session);
+        self.pty = Some(tab.pty);
+        self.mode = tab.mode;
+        self.running_cmd = tab.command;
+        self.running_started = tab.started;
+        self.last_status = tab.exit.map(|code| (code, Instant::now()));
+        self.cwd = tab.cwd;
+        self.cwd_label.clear();
+        self.blocks = tab.blocks;
+        self.focus = if self.mode == Mode::Compose {
+            Focus::Composer
+        } else {
+            Focus::Grid
+        };
+        self.got_prompt = true;
+        self.sel_anchor = None;
+        self.sel_drag = false;
+        self.editor.clear();
+        self.hscroll = 0;
+        self.composer_scroll = 0;
+        self.grid_dirty = true;
+        self.relayout();
+        self.toast("Tab attached");
+        self.request_redraw();
+    }
+
+    /// Kill and remove a background tab (the X button in the panel).
+    fn kill_background(&mut self, index: usize) {
+        if index >= self.background.len() {
+            return;
+        }
+        let tab = self.background.remove(index);
+        let command = tab.command.replace('\n', " ");
+        drop(tab);
+        self.relayout();
+        if command.is_empty() {
+            self.toast("Background shell closed");
+        } else {
+            self.toast(format!("Stopped {command}"));
+        }
         self.request_redraw();
     }
 
@@ -687,6 +1094,12 @@ impl PromptApp {
         }
         if self.mode == Mode::Running {
             next = next.min(now + Duration::from_millis(500));
+        }
+        if self.background.iter().any(|tab| tab.mode == Mode::Running) {
+            next = next.min(now + Duration::from_millis(500));
+            if now.duration_since(self.last_frame) >= Duration::from_millis(400) {
+                self.request_redraw();
+            }
         }
         if let Some((_, at)) = &self.autotype {
             next = next.min(*at);
@@ -779,6 +1192,16 @@ impl PromptApp {
             }
             if primary && code == KeyCode::Digit0 {
                 self.zoom_font(0.0);
+                return;
+            }
+            // Move the running command to the background panel.
+            if primary && shift && code == KeyCode::KeyD {
+                self.detach_running();
+                return;
+            }
+            if primary && shift && matches!(code, KeyCode::ArrowUp | KeyCode::ArrowDown) {
+                let direction = if code == KeyCode::ArrowUp { -1 } else { 1 };
+                self.jump_block(direction);
                 return;
             }
 
@@ -1225,6 +1648,12 @@ impl PromptApp {
         self.running_started = Instant::now();
         self.mode = Mode::Running;
         self.last_status = None;
+        // Make sure the cursor is on-screen before recording the block row.
+        if let Some(session) = &mut self.session {
+            session.clear_selection();
+            session.scroll_to_bottom();
+        }
+        self.start_block(text.clone());
 
         let bracketed = self
             .session
@@ -1246,10 +1675,6 @@ impl PromptApp {
         payload.push(b'\r');
         self.send_bytes(&payload);
 
-        if let Some(session) = &mut self.session {
-            session.clear_selection();
-            session.scroll_to_bottom();
-        }
         self.grid_dirty = true;
         self.editor.clear();
         self.hscroll = 0;
@@ -1640,6 +2065,18 @@ impl PromptApp {
             self.completion_popup = None;
             self.search = None;
         }
+        if state == ElementState::Pressed && self.mouse_in_panel(x, y) {
+            if let Some(index) = self.panel_entry_at(x, y) {
+                if let Some((cx, cy, cw, ch)) = self.panel.entries[index].close {
+                    if x >= cx && x < cx + cw && y >= cy && y < cy + ch {
+                        self.kill_background(index);
+                        return;
+                    }
+                }
+                self.attach_background(index);
+            }
+            return;
+        }
         if self.mouse_in_grid(x, y) {
             self.focus = Focus::Grid;
             if self.should_forward_mouse(button) {
@@ -1682,6 +2119,14 @@ impl PromptApp {
             }
             self.grid_dirty = true;
             if state == ElementState::Pressed {
+                if self.mode == Mode::Running {
+                    if let Some((bx, by, bw, bh)) = self.detach_rect {
+                        if x >= bx && x < bx + bw && y >= by && y < by + bh {
+                            self.detach_running();
+                            return;
+                        }
+                    }
+                }
                 let count = self.next_click_count(x, y);
                 if let Some(index) = self.card_index(x, y) {
                     if count == 2 {
@@ -1732,6 +2177,15 @@ impl PromptApp {
                 }
             }
             self.request_redraw();
+        } else if self.mouse_in_panel(x, y)
+            || self
+                .detach_rect
+                .map(|(bx, by, bw, bh)| x >= bx && x < bx + bw && y >= by && y < by + bh)
+                .unwrap_or(false)
+        {
+            if let Some(window) = &self.window {
+                window.set_cursor(winit::window::CursorIcon::Pointer);
+            }
         } else if self.mouse_in_card(x, y) || self.mouse_in_grid(x, y) {
             if let Some(window) = &self.window {
                 window.set_cursor(if self.mouse_in_card(x, y) {
@@ -1792,6 +2246,26 @@ impl PromptApp {
     fn mouse_in_card(&self, x: f32, y: f32) -> bool {
         let card = self.card;
         x >= card.x && x < card.x + card.w && y >= card.y && y < card.y + card.h
+    }
+
+    fn mouse_in_panel(&self, x: f32, y: f32) -> bool {
+        self.panel.w > 0.0
+            && x >= self.panel.x
+            && x < self.panel.x + self.panel.w
+            && y >= self.panel.y
+            && y < self.panel.y + self.panel.h
+    }
+
+    fn panel_entry_at(&self, x: f32, y: f32) -> Option<usize> {
+        if !self.mouse_in_panel(x, y) {
+            return None;
+        }
+        self.panel.entries.iter().position(|entry| {
+            y >= entry.y
+                && y < entry.y + entry.h
+                && x >= self.panel.x
+                && x < self.panel.x + self.panel.w
+        })
     }
 
     fn viewport_cell(&self, x: f32, y: f32) -> Option<(u16, u16)> {
@@ -1982,6 +2456,7 @@ impl PromptApp {
             }
         }
         self.draw_card();
+        self.draw_background_panel();
         self.draw_welcome();
         self.draw_search();
         self.draw_completion();
@@ -2018,6 +2493,7 @@ impl PromptApp {
         let cell_h = self.text.cell_h;
         let mode = self.mode;
         let cursor_on = self.cursor_on;
+        let scale = self.scale;
         let theme = self.theme.clone();
         let mut painter = Painter {
             pixmap: canvas,
@@ -2026,6 +2502,80 @@ impl PromptApp {
         };
 
         painter.fill(grid.x, grid.y, grid.w, grid.h, frame.background, 1.0);
+
+        // Command blocks: a tinted command row plus a rail in the left margin,
+        // so commands stay distinguishable while scrolling through scrollback.
+        if !self.blocks.is_empty() && !frame.alt_screen {
+            let offset = frame.scrollbar.offset;
+            let row_count = frame.rows as u64;
+            let visible = offset..offset.saturating_add(row_count);
+            for block in &self.blocks {
+                let header = block.start_row;
+                let end = block
+                    .end_row
+                    .map(|row| row.saturating_sub(1))
+                    .unwrap_or(offset.saturating_add(row_count.saturating_sub(1)));
+                // A full-screen program can repaint the rows a block used to
+                // occupy (top, for example, stays on the primary screen). Only
+                // decorate the block when its command line is still there.
+                let expected: String = block
+                    .command
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .chars()
+                    .take(24)
+                    .collect();
+                if expected.is_empty() {
+                    continue;
+                }
+                let header_text = if visible.contains(&header) {
+                    frame.row_text((header - offset) as u16)
+                } else {
+                    None
+                };
+                let header_ok = header_text
+                    .as_deref()
+                    .map(|text| text.contains(&expected))
+                    .unwrap_or(false);
+                if !header_ok {
+                    continue;
+                }
+                let color = match block.status {
+                    None => theme.accent,
+                    Some(0) => theme.dim,
+                    Some(_) => theme.red,
+                };
+                if visible.contains(&header) {
+                    let y = grid.y + (header - offset) as f32 * cell_h;
+                    painter.fill(grid.x, y, grid.w, cell_h, theme.accent, 0.06);
+                    painter.rounded(
+                        grid.x - 12.0 * scale,
+                        y + (cell_h - 6.0 * scale) / 2.0,
+                        6.0 * scale,
+                        6.0 * scale,
+                        3.0 * scale,
+                        color,
+                        1.0,
+                    );
+                }
+                let first = header.max(offset);
+                let last = end.min(visible.end.saturating_sub(1));
+                if last >= first {
+                    let top = grid.y + (first - offset) as f32 * cell_h + cell_h * 0.15;
+                    let height = (last - first + 1) as f32 * cell_h - cell_h * 0.3;
+                    painter.fill(
+                        grid.x - 8.0 * scale,
+                        top,
+                        (2.0 * scale).max(1.0),
+                        height,
+                        color,
+                        0.5,
+                    );
+                }
+            }
+        }
 
         let mut run: Option<Run> = None;
         let mut run_y;
@@ -2248,6 +2798,7 @@ impl PromptApp {
             text_x,
             text_y,
         };
+        self.detach_rect = None;
 
         let Some(canvas) = self.canvas.as_mut() else {
             return;
@@ -2347,6 +2898,18 @@ impl PromptApp {
             } else {
                 format!("{}  ·  {:.1}s", self.running_cmd, elapsed)
             };
+            let btn = "background";
+            let btn_w = painter.text.measure_text(btn, false) + s(16.0);
+            let btn_h = (cell_h - s(2.0)).max(s(10.0));
+            let by = text_y + (cell_h - btn_h) / 2.0;
+            let bx = text_x + text_w - btn_w;
+            let label_w = painter.text.measure_text(&label, false);
+            let show_button = text_x + label_w + s(12.0) < bx;
+            let label_w = if show_button {
+                (text_w - btn_w - s(10.0)).max(10.0)
+            } else {
+                text_w
+            };
             painter.text(
                 text_x,
                 text_y,
@@ -2354,9 +2917,24 @@ impl PromptApp {
                 theme.dim,
                 false,
                 None,
-                Clip::new(text_x, text_y, text_w, cell_h),
-                text_w,
+                Clip::new(text_x, text_y, label_w, cell_h),
+                label_w,
             );
+            if show_button {
+                let btn_clip = Clip::new(bx, by, btn_w, btn_h);
+                painter.rounded(bx, by, btn_w, btn_h, s(5.0), theme.panel_raised, 1.0);
+                painter.text(
+                    bx + s(8.0),
+                    by + (btn_h - cell_h) / 2.0,
+                    btn,
+                    theme.dim,
+                    false,
+                    None,
+                    btn_clip,
+                    btn_w,
+                );
+                self.detach_rect = Some((bx, by, btn_w, btn_h));
+            }
         } else {
             painter.text(
                 text_x,
@@ -2393,12 +2971,12 @@ impl PromptApp {
                     "enter run   shift+enter newline   ↑↓ history   ^R search   ^V paste"
                 }
             }
-            Mode::Running => "running — ctrl-c to interrupt",
+            Mode::Running => "running — ctrl-c to interrupt   ctrl-shift-d background",
             Mode::Direct => "this shell has no prompt integration; use zsh or bash",
         };
         let short_hint = match mode {
             Mode::Compose => "enter run   ↑ history   tab autocomplete",
-            Mode::Running => "running — ctrl-c stops",
+            Mode::Running => "running — ctrl-c stops   ctrl-shift-d background",
             Mode::Direct => "classic input — zsh/bash enable the composer",
         };
         let hint_text_y = hint_y + (hint_h - cell_h) / 2.0 + s(1.0);
@@ -2603,6 +3181,187 @@ fn draw_editor(
 }
 
 impl PromptApp {
+    fn draw_background_panel(&mut self) {
+        let panel = self.panel.clone();
+        if panel.w <= 0.0 || self.background.is_empty() {
+            self.panel.entries.clear();
+            return;
+        }
+        let cell_h = self.text.cell_h;
+        let scale = self.scale;
+        let s = move |v: f32| (v * scale).round();
+        let theme = self.theme.clone();
+        let pad = s(10.0);
+        let entry_h = pad * 2.0 + cell_h * 3.0 + s(4.0);
+        let close = s(18.0);
+
+        let rows: Vec<(String, String, Rgb, String, bool)> = self
+            .background
+            .iter()
+            .map(|tab| {
+                let (status, color) = if tab.mode == Mode::Running {
+                    (
+                        format!("running · {:.1}s", tab.started.elapsed().as_secs_f32()),
+                        theme.yellow,
+                    )
+                } else if let Some(code) = tab.exit {
+                    if code == 0 {
+                        ("finished · exit 0".to_string(), theme.dim)
+                    } else {
+                        (format!("failed · exit {code}"), theme.red)
+                    }
+                } else if let Some(duration) = tab.duration {
+                    (
+                        format!("finished · {:.1}s", duration.as_secs_f32()),
+                        theme.dim,
+                    )
+                } else {
+                    ("waiting".to_string(), theme.dim)
+                };
+                let command = if tab.command.is_empty() {
+                    "shell".to_string()
+                } else {
+                    tab.command.replace('\n', " ⏎ ")
+                };
+                let log = if tab.last_line.is_empty() {
+                    "no output yet".to_string()
+                } else {
+                    tab.last_line.replace('\n', " ")
+                };
+                (command, status, color, log, tab.mode == Mode::Running)
+            })
+            .collect();
+
+        let Some(canvas) = self.canvas.as_mut() else {
+            return;
+        };
+        let mut painter = Painter {
+            pixmap: canvas,
+            text: &mut self.text,
+            scale,
+        };
+
+        painter.rounded(
+            panel.x,
+            panel.y + s(4.0),
+            panel.w,
+            panel.h,
+            s(12.0),
+            theme.shadow,
+            0.45,
+        );
+        painter.rounded(
+            panel.x,
+            panel.y,
+            panel.w,
+            panel.h,
+            s(12.0),
+            theme.panel,
+            1.0,
+        );
+        painter.rounded_stroke(
+            panel.x,
+            panel.y,
+            panel.w,
+            panel.h,
+            s(12.0),
+            scale.max(1.0),
+            theme.border,
+            0.9,
+        );
+        let header = format!("Background · {}", rows.len());
+        painter.text(
+            panel.x + pad,
+            panel.y + pad,
+            &header,
+            theme.accent,
+            true,
+            None,
+            Clip::new(panel.x, panel.y, panel.w, panel.h),
+            panel.w - pad * 2.0,
+        );
+
+        let mut entries = Vec::new();
+        let mut y = panel.y + pad + cell_h + s(8.0);
+        let bottom = panel.y + panel.h - pad;
+        for (command, status, color, log, running) in rows {
+            if y + entry_h > bottom {
+                break;
+            }
+            let x = panel.x + pad;
+            let w = panel.w - pad * 2.0;
+            painter.rounded(x, y, w, entry_h, s(8.0), theme.panel_raised, 1.0);
+            if running {
+                painter.fill(
+                    x + s(1.0),
+                    y + s(6.0),
+                    s(2.0),
+                    entry_h - s(12.0),
+                    theme.yellow,
+                    0.8,
+                );
+            }
+
+            let text_w = (w - pad * 2.0 - close).max(10.0);
+            let clip = Clip::new(x + pad, y + pad, text_w, cell_h * 3.0);
+            painter.text(
+                x + pad,
+                y + pad,
+                &command,
+                theme.fg,
+                true,
+                None,
+                clip,
+                text_w,
+            );
+            painter.text(
+                x + pad,
+                y + pad + cell_h,
+                &status,
+                color,
+                false,
+                None,
+                clip,
+                text_w,
+            );
+            painter.text(
+                x + pad,
+                y + pad + cell_h * 2.0,
+                &format!("↳ {log}"),
+                theme.faint,
+                false,
+                None,
+                Clip::new(x + pad, y + pad + cell_h * 2.0, w - pad * 2.0, cell_h),
+                w - pad * 2.0,
+            );
+
+            let cx = x + w - close - s(6.0);
+            let cy = y + s(6.0);
+            painter.rounded(cx, cy, close, close, close / 2.0, theme.panel, 1.0);
+            let glyph = "×";
+            let glyph_w = painter.text.measure_text(glyph, false);
+            painter.text(
+                cx + (close - glyph_w) / 2.0,
+                cy + (close - cell_h) / 2.0,
+                glyph,
+                theme.dim,
+                false,
+                None,
+                Clip::new(cx, cy, close, close),
+                close,
+            );
+
+            entries.push(PanelEntry {
+                y,
+                h: entry_h,
+                close: Some((cx, cy, close, close)),
+            });
+            y += entry_h + s(8.0);
+        }
+        drop(painter);
+        self.panel.entries = entries;
+    }
+
     fn draw_welcome(&mut self) {
         if !self.welcome || self.dock_progress > 0.01 {
             return;
@@ -2938,6 +3697,40 @@ fn draw_run_at(
                 0.8,
             );
         }
+    }
+}
+
+/// Mark the newest open block as finished at the current cursor row.
+fn close_open_block(blocks: &mut [Block], session: &mut TerminalSession, status: Option<i32>) {
+    let Some(block) = blocks.last_mut() else {
+        return;
+    };
+    if block.end_row.is_some() {
+        return;
+    }
+    session.update_frame();
+    let row = session.scrollbar().offset
+        + session
+            .frame()
+            .cursor
+            .map(|cursor| cursor.y as u64)
+            .unwrap_or(0);
+    block.end_row = Some(row.max(block.start_row));
+    block.status = status;
+}
+
+/// Last useful output line for the background panel. A running command shows
+/// its newest line; a finished one skips the prompt printed underneath.
+fn panel_last_line(session: &TerminalSession, mode: Mode) -> String {
+    let line = if mode == Mode::Running {
+        session.last_line()
+    } else {
+        session.last_line_before_cursor()
+    };
+    if line.is_empty() {
+        session.last_line()
+    } else {
+        line
     }
 }
 
