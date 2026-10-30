@@ -45,8 +45,10 @@ launch, right-click **Prompt.app**, choose **Open**, then confirm.
   the command, its elapsed time and last output line; click the entry to bring
   it back, or the **×** to stop it.
 - **Ghost autocomplete** — dim suggestions from history and `PATH` appear as
-  you type; `Tab` (or `Right` at the end of the line) accepts them. `Tab` with
-  no suggestion opens the full completion popup.
+  you type; `Right` at the end of the line accepts them. `Tab` completes the
+  token, or opens the full completion popup when several candidates match;
+  move through the list with `Up`/`Down` (or `Shift+Tab`/`Tab`) and accept with
+  `Enter`.
 - **Ghostty VT core** — true-colour, scrollback, alternate screen, wide
   characters and emoji, mouse reporting, bracketed paste, semantic prompts.
 - **Zero-config first run** — Prompt writes its config, shell integration and
@@ -127,10 +129,10 @@ Prompt is designed for both macOS and Linux. `Cmd` means `Cmd` on macOS and
 | --- | --- | --- |
 | Run command | `Enter` | `Enter` |
 | New line | `Shift+Enter` | `Shift+Enter` |
-| Previous / next history | `Up` / `Down` | `Up` / `Down` |
+| Previous / next history or completion | `Up` / `Down` | `Up` / `Down` |
 | Search history | `Cmd+R` | `Ctrl+R` |
-| Complete / accept suggestion | `Tab` / `Shift+Tab` | `Tab` / `Shift+Tab` |
-| Accept inline suggestion | `Right` at end of line | `Right` at end of line |
+| Complete / cycle suggestions | `Tab` / `Shift+Tab` | `Tab` / `Shift+Tab` |
+| Accept suggestion | `Right` at end of line | `Right` at end of line |
 | Copy | `Cmd+C` (or `Ctrl+Shift+C` in a running program) | `Ctrl+Shift+C` |
 | Paste | `Cmd+V` | `Ctrl+V` in the composer, `Ctrl+Shift+V` while a program runs |
 | Cut | `Cmd+X` | `Ctrl+X` |

@@ -1936,8 +1936,6 @@ impl PromptApp {
         if code == KeyCode::Tab {
             if shift {
                 self.cycle_completion(true);
-            } else if self.completion_popup.is_none() && self.accept_inline_suggestion() {
-                return true;
             } else {
                 self.tab_complete();
             }
@@ -2517,10 +2515,22 @@ impl PromptApp {
             .completion
             .complete(&text, caret, &self.cwd, self.history.entries())
         else {
+            // No token completion available; fall back to the ghost text.
+            self.accept_inline_suggestion();
             return;
         };
         if set.items.len() == 1 {
+            // Unambiguous, so a longer history ghost may still win.
+            if self.accept_inline_suggestion() {
+                return;
+            }
             self.apply_completion(&set, 0);
+            return;
+        }
+        // Outside a command name the ghost usually covers the whole line, so
+        // keep preferring it. For a command token, show every match instead of
+        // silently taking the first PATH suggestion.
+        if !set.command && self.accept_inline_suggestion() {
             return;
         }
         let prefix = common_prefix(&set.items);

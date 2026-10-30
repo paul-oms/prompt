@@ -56,8 +56,8 @@ impl Default for Behavior {
 #[serde(default)]
 pub struct Ui {
     pub show_hints: bool,
-    /// Show dim ghost text for the history/command completion that Tab (or
-    /// Right at the end of a line) will accept.
+    /// Show dim ghost text for the history/command completion. Right (or Tab
+    /// when the completion is unambiguous) accepts it.
     pub inline_suggestions: bool,
     pub start_maximized: bool,
     pub window_width: u32,
@@ -139,7 +139,7 @@ copy_on_select = false
 
 [ui]
 show_hints = true
-# Dim completion preview shown while typing, accepted with Tab.
+# Dim completion preview; Right (or an unambiguous Tab) accepts it.
 inline_suggestions = true
 start_maximized = false
 window_width = 1080
