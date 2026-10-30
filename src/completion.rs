@@ -209,7 +209,10 @@ impl CompletionEngine {
             let mut seen = BTreeSet::new();
             for entry in history.iter().rev() {
                 let first = entry.split_whitespace().next().unwrap_or("");
-                if !first.is_empty() && first.starts_with(token) && seen.insert(first.to_string()) {
+                if !first.is_empty()
+                    && starts_with_ignore_ascii_case(first, token)
+                    && seen.insert(first.to_string())
+                {
                     items.push(Candidate {
                         value: first.to_string(),
                         display: first.to_string(),
@@ -224,7 +227,9 @@ impl CompletionEngine {
                 if items.len() >= 200 {
                     break;
                 }
-                if command.starts_with(token) && !items.iter().any(|c| &c.value == command) {
+                if starts_with_ignore_ascii_case(command, token)
+                    && !items.iter().any(|c| &c.value == command)
+                {
                     items.push(Candidate {
                         value: command.clone(),
                         display: command.clone(),
@@ -235,7 +240,7 @@ impl CompletionEngine {
         } else if token.starts_with('$') {
             let needle = &token[1..];
             for (key, _) in env::vars() {
-                if key.starts_with(needle) {
+                if starts_with_ignore_ascii_case(&key, needle) {
                     items.push(Candidate {
                         value: format!("${key}"),
                         display: key.clone(),
@@ -360,7 +365,7 @@ fn path_candidates(token: &str, cwd: &Path) -> Vec<Candidate> {
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.starts_with(&name_prefix) {
+        if !starts_with_ignore_ascii_case(&name, &name_prefix) {
             continue;
         }
         if name.starts_with('.') && !name_prefix.starts_with('.') {
@@ -406,20 +411,35 @@ fn split_dir(token: &str) -> (&str, &str) {
     }
 }
 
+/// Prefix comparison used by tab completion. Commands, environment variables
+/// and paths are matched without regard to ASCII case, while the accepted
+/// candidate keeps its real casing so the shell still sees a valid name.
+fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
+    value
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
 /// Longest common prefix, used to extend the token before showing a menu.
 pub fn common_prefix(items: &[Candidate]) -> String {
     let Some(first) = items.first() else {
         return String::new();
     };
-    let mut prefix = first.value.clone();
+    // Walk the first candidate's characters so the result keeps real casing
+    // even when the comparison ignores it.
+    let mut prefix: Vec<char> = first.value.chars().collect();
     for item in &items[1..] {
-        while !item.value.starts_with(&prefix) {
-            if prefix.pop().is_none() {
-                return String::new();
-            }
+        let shared = prefix
+            .iter()
+            .zip(item.value.chars())
+            .take_while(|(a, b)| a.eq_ignore_ascii_case(b))
+            .count();
+        prefix.truncate(shared);
+        if prefix.is_empty() {
+            break;
         }
     }
-    prefix
+    prefix.into_iter().collect()
 }
 
 /// Inline history suggestion ("ghost text") for the composer.
@@ -492,6 +512,57 @@ mod tests {
             },
         ];
         assert_eq!(common_prefix(&items), "cargo");
+    }
+
+    #[test]
+    fn common_prefix_ignores_case() {
+        let items = vec![
+            Candidate {
+                value: "Cargo.toml".into(),
+                display: "Cargo.toml".into(),
+                is_dir: false,
+            },
+            Candidate {
+                value: "cargo.lock".into(),
+                display: "cargo.lock".into(),
+                is_dir: false,
+            },
+        ];
+        assert_eq!(common_prefix(&items), "Cargo.");
+    }
+
+    #[test]
+    fn tab_completion_ignores_case() {
+        let mut engine = CompletionEngine::new();
+        engine.builtins = vec!["cargo".into(), "cat".into()];
+        engine.commands = vec!["cargo".into(), "cat".into()];
+        let set = engine
+            .complete("CAR", 3, Path::new("."), &[])
+            .expect("case-insensitive command match");
+        assert!(set.items.iter().any(|c| c.value == "cargo"), "{set:?}");
+    }
+
+    #[test]
+    fn history_completion_ignores_case() {
+        let mut engine = CompletionEngine::new();
+        engine.builtins.clear();
+        engine.commands.clear();
+        let history = vec!["Git status".to_string()];
+        let set = engine
+            .complete("git", 3, Path::new("."), &history)
+            .expect("case-insensitive history match");
+        assert!(set.items.iter().any(|c| c.value == "Git"), "{set:?}");
+    }
+
+    #[test]
+    fn path_completion_ignores_case() {
+        let dir = std::env::temp_dir().join(format!("prompt comp case {}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("README.md"), "").unwrap();
+        let items = path_candidates("rea", &dir);
+        assert!(items.iter().any(|c| c.value == "README.md"), "{items:?}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
