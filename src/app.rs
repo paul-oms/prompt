@@ -122,6 +122,24 @@ struct PanelLayout {
     entries: Vec<PanelEntry>,
 }
 
+/// Vertical geometry of the background panel's entry list. Shared by painting,
+/// hit testing and wheel scrolling so all three agree on the viewport.
+#[derive(Clone, Copy, Debug, Default)]
+struct PanelMetrics {
+    entry_h: f32,
+    gap: f32,
+    list_top: f32,
+    list_h: f32,
+    content_h: f32,
+    max_offset: f32,
+}
+
+impl PanelMetrics {
+    fn list_bottom(&self) -> f32 {
+        self.list_top + self.list_h
+    }
+}
+
 /// Rows in a block longer than this start collapsed to a 300-line window.
 const BLOCK_WINDOW: u64 = 300;
 
@@ -173,8 +191,8 @@ pub struct PromptApp {
     /// Tabs detached to the background panel. Their shells keep running.
     background: Vec<BackgroundTab>,
     panel: PanelLayout,
-    /// First background-tab row shown in the panel.
-    panel_scroll: usize,
+    /// Pixel offset of the first background-tab row in the panel viewport.
+    panel_scroll: f32,
     detach_rect: Option<(f32, f32, f32, f32)>,
     block_view: Option<BlockView>,
     pending_highlight: Option<(u64, u16, u16)>,
@@ -306,7 +324,7 @@ impl PromptApp {
             blocks: Vec::new(),
             background: Vec::new(),
             panel: PanelLayout::default(),
-            panel_scroll: 0,
+            panel_scroll: 0.0,
             detach_rect: None,
             block_view: None,
             pending_highlight: None,
@@ -630,7 +648,7 @@ impl PromptApp {
             h: (h - margin * 2.0).max(1.0),
             entries: Vec::new(),
         };
-        self.panel_scroll = self.panel_scroll.min(self.panel_scroll_range().1);
+        self.clamp_panel_scroll();
 
         let grid_x = margin + padding;
         let grid_y = margin + padding;
@@ -2920,7 +2938,7 @@ impl PromptApp {
         let x = pos.x as f32;
         let y = pos.y as f32;
         if self.mouse_in_panel(x, y) {
-            self.scroll_panel(lines.round() as i64);
+            self.scroll_panel(lines * self.text.cell_h);
             return;
         }
         if self.block_view.is_some() && (self.mouse_in_grid(x, y) || self.mouse_in_card(x, y)) {
@@ -2979,31 +2997,43 @@ impl PromptApp {
             && y < self.panel.y + self.panel.h
     }
 
-    /// Number of background-tab rows the panel can show and the largest valid
-    /// first-row offset. Kept in one place so drawing and wheel scrolling agree.
-    fn panel_scroll_range(&self) -> (usize, usize) {
-        let pad = self.s(10.0);
-        let gap = self.s(8.0);
-        let entry_h = pad * 2.0 + self.text.cell_h * 3.0 + self.s(4.0);
-        let top = self.panel.y + pad + self.text.cell_h + gap;
-        let bottom = self.panel.y + self.panel.h - pad;
-        let visible = if self.panel.w <= 0.0 || bottom - top < entry_h {
-            0
+    /// Vertical geometry of the panel's entry list. Kept in one place so
+    /// painting, hit testing and wheel scrolling agree on the viewport.
+    fn panel_metrics(&self) -> PanelMetrics {
+        let s = |v: f32| (v * self.scale).round();
+        let pad = s(10.0);
+        let gap = s(8.0);
+        let cell_h = self.text.cell_h;
+        let entry_h = pad * 2.0 + cell_h * 3.0 + s(4.0);
+        let list_top = self.panel.y + pad + cell_h + s(8.0);
+        let list_bottom = self.panel.y + self.panel.h - pad;
+        let list_h = (list_bottom - list_top).max(0.0);
+        let count = self.background.len() as f32;
+        let content_h = if count > 0.0 {
+            count * (entry_h + gap) - gap
         } else {
-            (((bottom - top - entry_h) / (entry_h + gap)).floor() as usize) + 1
+            0.0
         };
-        let max_scroll = if visible == 0 {
-            0
-        } else {
-            self.background.len().saturating_sub(visible)
-        };
-        (visible, max_scroll)
+        PanelMetrics {
+            entry_h,
+            gap,
+            list_top,
+            list_h,
+            content_h,
+            max_offset: (content_h - list_h).max(0.0),
+        }
     }
 
-    fn scroll_panel(&mut self, lines: i64) {
-        let (_, max_scroll) = self.panel_scroll_range();
-        let next = (self.panel_scroll as i64 + lines).clamp(0, max_scroll as i64) as usize;
-        if next != self.panel_scroll {
+    /// Clamp the panel's pixel scroll offset to the current geometry.
+    fn clamp_panel_scroll(&mut self) {
+        let max_offset = self.panel_metrics().max_offset;
+        self.panel_scroll = self.panel_scroll.clamp(0.0, max_offset);
+    }
+
+    fn scroll_panel(&mut self, pixels: f32) {
+        let max_offset = self.panel_metrics().max_offset;
+        let next = (self.panel_scroll + pixels).clamp(0.0, max_offset);
+        if (next - self.panel_scroll).abs() > 0.01 {
             self.panel_scroll = next;
             self.request_redraw();
         }
@@ -3515,7 +3545,14 @@ impl PromptApp {
         };
         let card_h = pad * 2.0 + lines as f32 * cell_h + s(6.0) + hint_h;
         let dock = self.dock_progress.clamp(0.0, 1.0);
-        let docked_w = (width - margin * 2.0).max(1.0);
+        // The background panel owns the right rail: keep the composer clear of
+        // it instead of drawing underneath.
+        let reserved = if self.panel.w > 0.0 {
+            self.panel.w + s(10.0)
+        } else {
+            0.0
+        };
+        let docked_w = (width - margin * 2.0 - reserved).max(1.0);
         let centred_w = (760.0 * scale).min(docked_w);
         let card_w = centred_w + (docked_w - centred_w) * dock;
         let card_x = margin + (docked_w - card_w) / 2.0;
@@ -4060,7 +4097,6 @@ impl PromptApp {
         let s = move |v: f32| (v * scale).round();
         let theme = self.theme.clone();
         let pad = s(10.0);
-        let entry_h = pad * 2.0 + cell_h * 3.0 + s(4.0);
         let close = s(18.0);
 
         let rows: Vec<(String, String, Rgb, String, bool)> = self
@@ -4107,10 +4143,9 @@ impl PromptApp {
             })
             .collect();
 
-        let (visible, max_scroll) = self.panel_scroll_range();
-        self.panel_scroll = self.panel_scroll.min(max_scroll);
-        let first = self.panel_scroll;
-        let total = rows.len();
+        let metrics = self.panel_metrics();
+        self.clamp_panel_scroll();
+        let offset = self.panel_scroll;
 
         let Some(canvas) = self.canvas.as_mut() else {
             return;
@@ -4162,88 +4197,102 @@ impl PromptApp {
         );
 
         let mut entries = Vec::new();
-        let list_top = panel.y + pad + cell_h + s(8.0);
-        let mut y = list_top;
-        let bottom = panel.y + panel.h - pad;
-        for (index, (command, status, color, log, running)) in
-            rows.into_iter().enumerate().skip(first)
-        {
-            if y + entry_h > bottom {
+        let list_top = metrics.list_top;
+        let list_bottom = metrics.list_bottom();
+        let entry_h = metrics.entry_h;
+        let row_h = entry_h + metrics.gap;
+        for (index, (command, status, color, log, running)) in rows.into_iter().enumerate() {
+            // Rows scroll as pixels, so the first and last entries can be shown
+            // partially instead of popping in and out whole.
+            let y = list_top - offset + index as f32 * row_h;
+            if y + entry_h <= list_top + 0.5 {
+                continue;
+            }
+            if y >= list_bottom - 0.5 {
                 break;
             }
+            let vis_top = y.max(list_top);
+            let vis_bottom = (y + entry_h).min(list_bottom);
+            let vis_h = vis_bottom - vis_top;
+            if vis_h <= 1.0 {
+                continue;
+            }
+            let clipped = vis_top > y + 0.5 || vis_bottom < y + entry_h - 0.5;
             let x = panel.x + pad;
             let w = panel.w - pad * 2.0;
-            painter.rounded(x, y, w, entry_h, s(8.0), theme.panel_raised, 1.0);
+            let radius = if clipped { 0.0 } else { s(8.0) };
+            painter.rounded(x, vis_top, w, vis_h, radius, theme.panel_raised, 1.0);
             if running {
-                painter.fill(
-                    x + s(1.0),
-                    y + s(6.0),
-                    s(2.0),
-                    entry_h - s(12.0),
-                    theme.yellow,
-                    0.8,
-                );
+                let bar_top = (y + s(6.0)).max(vis_top);
+                let bar_bottom = (y + entry_h - s(6.0)).min(vis_bottom);
+                if bar_bottom > bar_top {
+                    painter.fill(
+                        x + s(1.0),
+                        bar_top,
+                        s(2.0),
+                        bar_bottom - bar_top,
+                        theme.yellow,
+                        0.8,
+                    );
+                }
             }
 
             let text_w = (w - pad * 2.0 - close).max(10.0);
-            let clip = Clip::new(x + pad, y + pad, text_w, cell_h * 3.0);
-            painter.text(
-                x + pad,
-                y + pad,
-                &command,
-                theme.fg,
-                true,
-                None,
-                clip,
-                text_w,
-            );
-            painter.text(
-                x + pad,
-                y + pad + cell_h,
-                &status,
-                color,
-                false,
-                None,
-                clip,
-                text_w,
-            );
-            painter.text(
-                x + pad,
-                y + pad + cell_h * 2.0,
-                &format!("↳ {log}"),
-                theme.faint,
-                false,
-                None,
-                Clip::new(x + pad, y + pad + cell_h * 2.0, w - pad * 2.0, cell_h),
-                w - pad * 2.0,
-            );
+            let text_x = x + pad;
+            let lines = [
+                (command, theme.fg, true),
+                (status, color, false),
+                (format!("↳ {log}"), theme.faint, false),
+            ];
+            for (i, (text, text_color, text_bold)) in lines.iter().enumerate() {
+                let line_top = y + pad + cell_h * i as f32;
+                let top = line_top.max(vis_top);
+                let bottom = (line_top + cell_h).min(vis_bottom);
+                if bottom - top < 1.0 {
+                    continue;
+                }
+                painter.text(
+                    text_x,
+                    line_top,
+                    text,
+                    *text_color,
+                    *text_bold,
+                    None,
+                    Clip::new(text_x, top, text_w, bottom - top),
+                    text_w,
+                );
+            }
 
             let cx = x + w - close - s(6.0);
             let cy = y + s(6.0);
-            painter.rounded(cx, cy, close, close, close / 2.0, theme.panel, 1.0);
-            let glyph = "×";
-            let glyph_w = painter.text.measure_text(glyph, false);
-            painter.text(
-                cx + (close - glyph_w) / 2.0,
-                cy + (close - cell_h) / 2.0,
-                glyph,
-                theme.dim,
-                false,
-                None,
-                Clip::new(cx, cy, close, close),
-                close,
-            );
+            let close_rect = if clipped {
+                None
+            } else {
+                painter.rounded(cx, cy, close, close, close / 2.0, theme.panel, 1.0);
+                let glyph = "×";
+                let glyph_w = painter.text.measure_text(glyph, false);
+                painter.text(
+                    cx + (close - glyph_w) / 2.0,
+                    cy + (close - cell_h) / 2.0,
+                    glyph,
+                    theme.dim,
+                    false,
+                    None,
+                    Clip::new(cx, cy, close, close),
+                    close,
+                );
+                Some((cx, cy, close, close))
+            };
 
             entries.push(PanelEntry {
                 tab: index,
-                y,
-                h: entry_h,
-                close: Some((cx, cy, close, close)),
+                y: vis_top,
+                h: vis_h,
+                close: close_rect,
             });
-            y += entry_h + s(8.0);
         }
-        if max_scroll > 0 && visible > 0 {
-            let track_h = bottom - list_top;
+        if metrics.max_offset > 0.5 && metrics.list_h > 0.0 {
+            let track_h = metrics.list_h;
             let track_x = panel.x + panel.w - s(5.0);
             let track_w = s(3.0);
             painter.rounded(
@@ -4255,10 +4304,10 @@ impl PromptApp {
                 theme.border,
                 0.35,
             );
-            let thumb_h = (track_h * visible as f32 / total as f32)
+            let thumb_h = (track_h * (metrics.list_h / metrics.content_h.max(1.0)))
                 .max(s(24.0))
                 .min(track_h);
-            let progress = first as f32 / max_scroll as f32;
+            let progress = offset / metrics.max_offset;
             painter.rounded(
                 track_x,
                 list_top + (track_h - thumb_h) * progress,
