@@ -4,11 +4,9 @@
 
 # Prompt
 
-**A terminal that works they way you expect it to.**
+**Prompt is a macOS/Linux terminal for people who enjoy polished, beautiful software.**
 
-Prompt is a macOS/Linux terminal for people who enjoy polished, beautiful software.
-
-The command line is a proper text editor, and works how you expect something you put text into to work: click anywhere, drag
+The command line is a proper text editor, and works precisely how you would expect it to work: click anywhere, drag
 to select, copy and paste with the shortcuts you already know, complete with syntax
 highlighting, multiline commands, history search, background terminals, and tab completion.
 
