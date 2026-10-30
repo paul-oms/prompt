@@ -81,6 +81,12 @@ jobs:
     needs: build-dmg
     runs-on: ubuntu-latest
     steps:
+      # gh release needs a git checkout to verify the release tag.
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
       - name: Download DMGs
         uses: actions/download-artifact@v8
         with:
@@ -99,10 +105,13 @@ jobs:
             exit 1
           fi
 
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "${assets[@]}" --clobber
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
           else
             gh release create "$TAG" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --title "Prompt $TAG" \
               --generate-notes
