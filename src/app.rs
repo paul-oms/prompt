@@ -1604,13 +1604,28 @@ impl PromptApp {
 
     fn check_exit(&mut self, event_loop: &ActiveEventLoop) {
         let Some(pty) = &mut self.pty else { return };
-        if let Some(code) = pty.try_exit_code() {
-            if !self.exited {
-                self.exited = true;
-                self.toast(format!("Shell exited ({code})"));
-                event_loop.exit();
-            }
+        let Some(code) = pty.try_exit_code() else { return };
+        if self.exited {
+            return;
         }
+        self.exited = true;
+
+        // Exiting a shell closes that tab only. While other shells are still
+        // running in the background panel, bring the most recent one forward
+        // instead of taking the whole terminal down.
+        if let Some(index) = self.background.len().checked_sub(1) {
+            // Drop the dead tab rather than parking it in the panel.
+            self.session = None;
+            self.pty = None;
+            self.blocks.clear();
+            self.attach_background(index);
+            self.exited = false;
+            self.toast(format!("Shell exited ({code})"));
+            return;
+        }
+
+        self.toast(format!("Shell exited ({code})"));
+        event_loop.exit();
     }
 
     fn update_timers(&mut self, event_loop: &ActiveEventLoop) {
