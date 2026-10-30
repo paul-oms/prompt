@@ -100,6 +100,8 @@ struct BackgroundTab {
     cwd: PathBuf,
     last_line: String,
     blocks: Vec<Block>,
+    /// Scrollback row the user was looking at when the tab was detached.
+    scroll: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -116,6 +118,32 @@ struct PanelLayout {
     w: f32,
     h: f32,
     entries: Vec<PanelEntry>,
+}
+
+/// Rows in a block longer than this start collapsed to a 300-line window.
+const BLOCK_WINDOW: u64 = 300;
+
+#[derive(Clone, Copy, Debug)]
+struct BlockMatch {
+    row: u64,
+    start: u16,
+    end: u16,
+}
+
+struct BlockSearch {
+    query: String,
+    active: bool,
+    matches: Vec<BlockMatch>,
+    selected: usize,
+}
+
+/// Full-grid reading mode for one command block.
+struct BlockView {
+    index: usize,
+    /// Absolute row at the top of the grid.
+    scroll: u64,
+    expanded: bool,
+    search: Option<BlockSearch>,
 }
 
 pub struct PromptApp {
@@ -144,6 +172,8 @@ pub struct PromptApp {
     background: Vec<BackgroundTab>,
     panel: PanelLayout,
     detach_rect: Option<(f32, f32, f32, f32)>,
+    block_view: Option<BlockView>,
+    pending_highlight: Option<(u64, u16, u16)>,
     editor: Editor,
     history: History,
     completion: CompletionEngine,
@@ -267,6 +297,8 @@ impl PromptApp {
             background: Vec::new(),
             panel: PanelLayout::default(),
             detach_rect: None,
+            block_view: None,
+            pending_highlight: None,
             editor: Editor::default(),
             history,
             completion: CompletionEngine::new(),
@@ -508,6 +540,8 @@ impl PromptApp {
         self.sel_anchor = None;
         self.sel_drag = false;
         self.editor.clear();
+        self.block_view = None;
+        self.pending_highlight = None;
         self.hscroll = 0;
         self.composer_scroll = 0;
         self.integration_deadline = Instant::now() + Duration::from_secs(4);
@@ -655,7 +689,7 @@ impl PromptApp {
                 if let Some(session) = &mut self.session {
                     let was_at_bottom = session.frame().scrollbar.at_bottom();
                     session.write(&data);
-                    if was_at_bottom {
+                    if was_at_bottom && self.block_view.is_none() {
                         session.scroll_to_bottom();
                     }
                     let replies = session.take_pty_replies();
@@ -733,6 +767,7 @@ impl PromptApp {
                 }
             }
             if changed {
+                tab.session.scroll_to_bottom();
                 tab.session.update_frame();
                 tab.last_line = panel_last_line(&tab.session, tab.mode);
                 redraw = true;
@@ -905,7 +940,504 @@ impl PromptApp {
         if let Some(session) = &mut self.session {
             close_open_block(&mut self.blocks, session, status);
         }
+        if let Some(block) = self.blocks.last() {
+            if let Some(end) = block.end_row {
+                let lines = end.saturating_sub(block.start_row) + 1;
+                if lines > BLOCK_WINDOW {
+                    let key = if keys::is_macos() {
+                        "⌘⇧B"
+                    } else {
+                        "ctrl-shift-b"
+                    };
+                    self.toast(format!("{lines} lines · {key} to review this block"));
+                }
+            }
+        }
         self.grid_dirty = true;
+    }
+
+    // ---- block view -------------------------------------------------------
+
+    /// Inclusive absolute row range of a block. The live block ends at the
+    /// cursor until its command finishes.
+    fn block_range(&self, index: usize) -> Option<(u64, u64)> {
+        let block = self.blocks.get(index)?;
+        let end = block.end_row.unwrap_or_else(|| {
+            self.session
+                .as_ref()
+                .map(|session| session.scrollbar().total.saturating_sub(1))
+                .unwrap_or(block.start_row)
+        });
+        Some((block.start_row, end.max(block.start_row)))
+    }
+
+    /// Rows reachable in a block right now: a 300-line window until expanded.
+    fn block_window(&self, index: usize, expanded: bool) -> Option<(u64, u64)> {
+        let (start, end) = self.block_range(index)?;
+        let end = if expanded {
+            end
+        } else {
+            start.saturating_add(BLOCK_WINDOW - 1).min(end)
+        };
+        Some((start, end))
+    }
+
+    fn open_block_view(&mut self, index: Option<usize>) {
+        if self.blocks.is_empty() {
+            self.toast("No command blocks yet");
+            return;
+        }
+        let index = index
+            .unwrap_or(self.blocks.len().saturating_sub(1))
+            .min(self.blocks.len() - 1);
+        let Some((start, _)) = self.block_range(index) else {
+            return;
+        };
+        if let Some(session) = &mut self.session {
+            session.clear_selection();
+        }
+        self.pending_highlight = None;
+        self.block_view = Some(BlockView {
+            index,
+            scroll: start,
+            expanded: false,
+            search: None,
+        });
+        self.focus = Focus::Grid;
+        self.clamp_block_view();
+        self.grid_dirty = true;
+        self.request_redraw();
+    }
+
+    fn close_block_view(&mut self) {
+        if self.block_view.take().is_none() {
+            return;
+        }
+        self.pending_highlight = None;
+        if let Some(session) = &mut self.session {
+            session.clear_selection();
+            session.scroll_to_bottom();
+            session.update_frame();
+        }
+        self.focus = Focus::Composer;
+        self.grid_dirty = true;
+        self.request_redraw();
+    }
+
+    fn clamp_block_view(&mut self) {
+        let rows = self.grid.rows.max(1) as u64;
+        let Some(index) = self.block_view.as_ref().map(|view| view.index) else {
+            return;
+        };
+        let expanded = self
+            .block_view
+            .as_ref()
+            .map(|view| view.expanded)
+            .unwrap_or(false);
+        let Some((start, end)) = self.block_window(index, expanded) else {
+            return;
+        };
+        let max_top = end.saturating_sub(rows - 1).max(start);
+        if let Some(view) = &mut self.block_view {
+            view.scroll = view.scroll.clamp(start, max_top);
+        }
+    }
+
+    fn scroll_block(&mut self, delta: i64) {
+        if let Some(view) = &mut self.block_view {
+            view.scroll = (view.scroll as i64 + delta).max(0) as u64;
+        } else {
+            return;
+        }
+        self.clamp_block_view();
+        self.grid_dirty = true;
+        self.request_redraw();
+    }
+
+    fn snap_block(&mut self, top: bool) {
+        let Some(index) = self.block_view.as_ref().map(|view| view.index) else {
+            return;
+        };
+        let expanded = self
+            .block_view
+            .as_ref()
+            .map(|view| view.expanded)
+            .unwrap_or(false);
+        let Some((start, end)) = self.block_window(index, expanded) else {
+            return;
+        };
+        let rows = self.grid.rows.max(1) as u64;
+        let target = if top {
+            start
+        } else {
+            end.saturating_sub(rows - 1).max(start)
+        };
+        if let Some(view) = &mut self.block_view {
+            view.scroll = target;
+        }
+        self.grid_dirty = true;
+        self.request_redraw();
+    }
+
+    fn switch_block(&mut self, delta: i32) {
+        let Some(view) = &self.block_view else { return };
+        let last = self.blocks.len().saturating_sub(1) as i32;
+        let index = (view.index as i32 + delta).clamp(0, last) as usize;
+        let Some((start, _)) = self.block_range(index) else {
+            return;
+        };
+        if let Some(session) = &mut self.session {
+            session.clear_selection();
+        }
+        self.pending_highlight = None;
+        if let Some(view) = &mut self.block_view {
+            view.index = index;
+            view.scroll = start;
+            view.expanded = false;
+            view.search = None;
+        }
+        self.clamp_block_view();
+        self.grid_dirty = true;
+        self.request_redraw();
+    }
+
+    fn toggle_block_expanded(&mut self) {
+        let Some(view) = &mut self.block_view else {
+            return;
+        };
+        view.expanded = !view.expanded;
+        self.clamp_block_view();
+        self.grid_dirty = true;
+        self.request_redraw();
+    }
+
+    /// Read a block's text a viewport at a time. Used lazily by search.
+    fn block_text(&mut self, start: u64, end: u64) -> Vec<String> {
+        let total = (end.saturating_sub(start) + 1) as usize;
+        let mut out = vec![String::new(); total];
+        let Some(session) = &mut self.session else {
+            return out;
+        };
+        let saved = session.scrollbar().offset;
+        let mut row = start;
+        while row <= end {
+            session.scroll_to_row(row);
+            session.update_frame();
+            let offset = session.scrollbar().offset;
+            let view_rows = session.frame().rows as u64;
+            let mut progressed = false;
+            for y in 0..view_rows {
+                let abs = offset + y;
+                if abs < start || abs > end {
+                    continue;
+                }
+                let index = (abs - start) as usize;
+                if index < out.len() && out[index].is_empty() {
+                    if let Some(text) = session.frame().row_text(y as u16) {
+                        out[index] = text.trim_end().to_string();
+                        progressed = true;
+                    }
+                }
+            }
+            if !progressed {
+                break;
+            }
+            row = offset + view_rows.max(1);
+        }
+        session.scroll_to_row(saved);
+        session.update_frame();
+        out
+    }
+
+    fn run_block_search(&mut self) {
+        let Some(view) = &self.block_view else { return };
+        let index = view.index;
+        let expanded = view.expanded;
+        let query = view
+            .search
+            .as_ref()
+            .map(|search| search.query.trim().to_string())
+            .unwrap_or_default();
+        let Some((start, end)) = self.block_window(index, expanded) else {
+            return;
+        };
+        if query.is_empty() {
+            if let Some(search) = self
+                .block_view
+                .as_mut()
+                .and_then(|view| view.search.as_mut())
+            {
+                search.matches.clear();
+                search.selected = 0;
+                search.active = false;
+            }
+            self.pending_highlight = None;
+            self.request_redraw();
+            return;
+        }
+
+        let rows = self.block_text(start, end);
+        let needle = query.to_lowercase();
+        let mut matches = Vec::new();
+        for (i, text) in rows.iter().enumerate() {
+            let lower = text.to_lowercase();
+            let mut from = 0;
+            while from < lower.len() {
+                let Some(pos) = lower[from..].find(&needle) else {
+                    break;
+                };
+                let at = from + pos;
+                let byte_end = at + needle.len();
+                if text.is_char_boundary(at) && text.is_char_boundary(byte_end) {
+                    let start_col = unicode_width::UnicodeWidthStr::width(&text[..at]) as u16;
+                    let end_col = start_col
+                        + unicode_width::UnicodeWidthStr::width(&text[at..byte_end]) as u16;
+                    matches.push(BlockMatch {
+                        row: start + i as u64,
+                        start: start_col,
+                        end: end_col.max(start_col + 1),
+                    });
+                }
+                from = byte_end.max(at + 1);
+            }
+        }
+        let count = matches.len();
+        let first = matches.first().copied();
+        if let Some(search) = self
+            .block_view
+            .as_mut()
+            .and_then(|view| view.search.as_mut())
+        {
+            search.matches = matches;
+            search.selected = 0;
+            search.active = false;
+        }
+        if let Some(first) = first {
+            self.select_block_match(0, first);
+        }
+        if count == 0 {
+            let shown = end.saturating_sub(start) + 1;
+            let total = self
+                .block_range(index)
+                .map(|(first, last)| last.saturating_sub(first) + 1)
+                .unwrap_or(shown);
+            if !expanded && shown < total {
+                self.toast("No match in the first 300 lines — press e to expand");
+            } else {
+                self.toast("No matches in this block");
+            }
+        } else {
+            self.toast(format!(
+                "{count} match{}",
+                if count == 1 { "" } else { "es" }
+            ));
+        }
+    }
+
+    fn select_block_match(&mut self, selected: usize, matched: BlockMatch) {
+        let Some(index) = self.block_view.as_ref().map(|view| view.index) else {
+            return;
+        };
+        let expanded = self
+            .block_view
+            .as_ref()
+            .map(|view| view.expanded)
+            .unwrap_or(false);
+        let Some((start, _)) = self.block_window(index, expanded) else {
+            return;
+        };
+        let rows = self.grid.rows.max(1) as u64;
+        let target = matched.row.saturating_sub(rows / 2).max(start);
+        if let Some(view) = &mut self.block_view {
+            view.scroll = target;
+            if let Some(search) = &mut view.search {
+                search.selected = selected;
+            }
+        }
+        self.clamp_block_view();
+        self.pending_highlight = Some((matched.row, matched.start, matched.end));
+        self.grid_dirty = true;
+        self.request_redraw();
+    }
+
+    fn step_block_match(&mut self, delta: i32) {
+        let next = {
+            let Some(view) = &self.block_view else { return };
+            let Some(search) = &view.search else { return };
+            if search.matches.is_empty() {
+                return;
+            }
+            let len = search.matches.len() as i32;
+            let index = (search.selected as i32 + delta).rem_euclid(len) as usize;
+            (index, search.matches[index])
+        };
+        self.select_block_match(next.0, next.1);
+    }
+
+    fn handle_block_key(
+        &mut self,
+        code: KeyCode,
+        primary: bool,
+        ctrl: bool,
+        shift: bool,
+        event: &KeyEvent,
+    ) -> bool {
+        let Some(view) = &self.block_view else {
+            return false;
+        };
+        let search_active = view
+            .search
+            .as_ref()
+            .map(|search| search.active)
+            .unwrap_or(false);
+
+        if search_active {
+            match code {
+                KeyCode::Escape => {
+                    if let Some(search) = self
+                        .block_view
+                        .as_mut()
+                        .and_then(|view| view.search.as_mut())
+                    {
+                        search.active = false;
+                    }
+                }
+                KeyCode::Enter => self.run_block_search(),
+                KeyCode::Backspace => {
+                    if let Some(search) = self
+                        .block_view
+                        .as_mut()
+                        .and_then(|view| view.search.as_mut())
+                    {
+                        search.query.pop();
+                    }
+                }
+                _ => {
+                    if let Some(text) = &event.text {
+                        if !text.is_empty() && !text.chars().any(|c| c.is_control()) {
+                            if let Some(search) = self
+                                .block_view
+                                .as_mut()
+                                .and_then(|view| view.search.as_mut())
+                            {
+                                search.query.push_str(text);
+                            }
+                        }
+                    }
+                }
+            }
+            self.request_redraw();
+            return true;
+        }
+
+        if primary && code == KeyCode::KeyC && (keys::is_macos() || shift) {
+            self.copy_selection();
+            return true;
+        }
+        // Interrupt the foreground command without leaving the block.
+        if ctrl && code == KeyCode::KeyC {
+            self.send_bytes(&[3]);
+            return true;
+        }
+        if primary && shift && matches!(code, KeyCode::ArrowUp | KeyCode::ArrowDown) {
+            self.switch_block(if code == KeyCode::ArrowUp { -1 } else { 1 });
+            return true;
+        }
+        match code {
+            KeyCode::Escape => self.close_block_view(),
+            KeyCode::Slash => {
+                if let Some(view) = &mut self.block_view {
+                    let search = view.search.get_or_insert_with(|| BlockSearch {
+                        query: String::new(),
+                        active: false,
+                        matches: Vec::new(),
+                        selected: 0,
+                    });
+                    search.active = true;
+                }
+                self.request_redraw();
+            }
+            KeyCode::KeyE => self.toggle_block_expanded(),
+            KeyCode::Home => self.snap_block(true),
+            KeyCode::End => self.snap_block(false),
+            KeyCode::KeyG => self.snap_block(!shift),
+            KeyCode::PageUp => self.scroll_block(-(self.grid.rows.max(3) as i64 - 2)),
+            KeyCode::PageDown => self.scroll_block(self.grid.rows.max(3) as i64 - 2),
+            KeyCode::ArrowUp => self.scroll_block(-1),
+            KeyCode::ArrowDown => self.scroll_block(1),
+            KeyCode::BracketLeft | KeyCode::Comma => self.switch_block(-1),
+            KeyCode::BracketRight | KeyCode::Period => self.switch_block(1),
+            KeyCode::KeyN => self.step_block_match(if shift { -1 } else { 1 }),
+            _ => {}
+        }
+        true
+    }
+
+    /// Point the terminal viewport at the block view's current row.
+    fn apply_block_view(&mut self) {
+        if self.block_view.is_none() {
+            return;
+        }
+        let before = self
+            .block_view
+            .as_ref()
+            .map(|view| view.scroll)
+            .unwrap_or(0);
+        self.clamp_block_view();
+        let Some(scroll) = self.block_view.as_ref().map(|view| view.scroll) else {
+            return;
+        };
+        if scroll != before {
+            self.grid_dirty = true;
+        }
+        if let Some(session) = &mut self.session {
+            session.scroll_to_row(scroll);
+        }
+    }
+
+    fn apply_pending_highlight(&mut self) {
+        let Some((row, start, end)) = self.pending_highlight.take() else {
+            return;
+        };
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let offset = session.scrollbar().offset;
+        let rows = session.frame().rows as u64;
+        if row >= offset && row < offset.saturating_add(rows) {
+            let y = (row - offset) as u16;
+            session.set_selection(Some((start, y)), (end.saturating_sub(1), y));
+            session.update_frame();
+            self.grid_dirty = true;
+            self.request_redraw();
+        }
+    }
+
+    fn block_status_line(&self) -> (String, Rgb) {
+        let Some(view) = &self.block_view else {
+            return (String::new(), self.theme.dim);
+        };
+        if let Some(search) = &view.search {
+            if search.active || !search.matches.is_empty() {
+                let total = search.matches.len();
+                let current = if total == 0 { 0 } else { search.selected + 1 };
+                let query = if search.active {
+                    format!("{}▏", search.query)
+                } else {
+                    search.query.clone()
+                };
+                return (
+                    format!("/{query}   {current}/{total} matches"),
+                    self.theme.fg,
+                );
+            }
+        }
+        let command = self
+            .blocks
+            .get(view.index)
+            .map(|block| block.command.replace('\n', " ⏎ "))
+            .unwrap_or_default();
+        (command, self.theme.dim)
     }
 
     // ---- background tabs --------------------------------------------------
@@ -915,6 +1447,7 @@ impl PromptApp {
         let session = self.session.take()?;
         let pty = self.pty.take()?;
         let mode = self.mode;
+        let scroll = session.scrollbar().offset;
         let mut tab = BackgroundTab {
             session,
             pty,
@@ -926,6 +1459,7 @@ impl PromptApp {
             cwd: self.cwd.clone(),
             last_line: String::new(),
             blocks: std::mem::take(&mut self.blocks),
+            scroll,
         };
         tab.session.scroll_to_bottom();
         tab.session.update_frame();
@@ -960,12 +1494,9 @@ impl PromptApp {
             return;
         }
         let mut tab = self.background.remove(index);
-        if self.mode != Mode::Running && self.session.is_some() {
-            // Drop the idle foreground shell; its history is already saved.
-            self.session = None;
-            self.pty = None;
-            self.blocks.clear();
-        } else if let Some(current) = self.take_foreground() {
+        // Keep whatever the user was doing: the current tab moves into the
+        // panel so the two tabs simply swap.
+        if let Some(current) = self.take_foreground() {
             self.background.push(current);
         }
 
@@ -984,7 +1515,11 @@ impl PromptApp {
         tab.session.update_frame();
         if tab.mode != Mode::Running {
             close_open_block(&mut tab.blocks, &mut tab.session, tab.exit);
+            tab.session.scroll_to_row(tab.scroll);
+        } else {
+            tab.session.scroll_to_bottom();
         }
+        tab.session.update_frame();
         self.session = Some(tab.session);
         self.pty = Some(tab.pty);
         self.mode = tab.mode;
@@ -1003,6 +1538,8 @@ impl PromptApp {
         self.sel_anchor = None;
         self.sel_drag = false;
         self.editor.clear();
+        self.block_view = None;
+        self.pending_highlight = None;
         self.hscroll = 0;
         self.composer_scroll = 0;
         self.grid_dirty = true;
@@ -1192,6 +1729,19 @@ impl PromptApp {
             }
             if primary && code == KeyCode::Digit0 {
                 self.zoom_font(0.0);
+                return;
+            }
+            // Reading mode for one command block.
+            if primary && shift && code == KeyCode::KeyB {
+                if self.block_view.is_some() {
+                    self.close_block_view();
+                } else {
+                    self.open_block_view(None);
+                }
+                return;
+            }
+            if self.block_view.is_some() && self.handle_block_key(code, primary, ctrl, shift, event)
+            {
                 return;
             }
             // Move the running command to the background panel.
@@ -1631,6 +2181,9 @@ impl PromptApp {
 
     fn submit(&mut self) {
         self.begin_dock();
+        if self.block_view.is_some() {
+            self.close_block_view();
+        }
         let text = self.editor.text().to_string();
         if text.trim().is_empty() {
             self.editor.clear();
@@ -2113,6 +2666,9 @@ impl PromptApp {
                 self.request_redraw();
             }
         } else if self.mouse_in_card(x, y) {
+            if self.block_view.is_some() {
+                self.close_block_view();
+            }
             self.focus = Focus::Composer;
             if let Some(session) = &mut self.session {
                 session.clear_selection();
@@ -2204,6 +2760,10 @@ impl PromptApp {
         };
         let x = pos.x as f32;
         let y = pos.y as f32;
+        if self.block_view.is_some() && (self.mouse_in_grid(x, y) || self.mouse_in_card(x, y)) {
+            self.scroll_block(lines.round() as i64);
+            return;
+        }
         if self.mouse_in_grid(x, y) {
             if self.should_forward_mouse(MouseButton::Left) && self.mode != Mode::Compose {
                 self.forward_wheel(delta, x, y);
@@ -2433,9 +2993,11 @@ impl PromptApp {
             return;
         }
 
+        self.apply_block_view();
         if let Some(session) = &mut self.session {
             session.update_frame();
         }
+        self.apply_pending_highlight();
         if self.grid_dirty {
             if let Some(cache) = &mut self.grid_cache {
                 cache.fill(self.theme.bg.solid());
@@ -2455,6 +3017,7 @@ impl PromptApp {
                 canvas.draw_pixmap(0, 0, cache.as_ref(), &paint, Transform::identity(), None);
             }
         }
+        self.draw_block_bar();
         self.draw_card();
         self.draw_background_panel();
         self.draw_welcome();
@@ -2745,7 +3308,10 @@ impl PromptApp {
             0.0
         };
         let mode = self.mode;
-        let lines = if mode == Mode::Compose {
+        let block_view = self.block_view.is_some();
+        let lines = if block_view {
+            1
+        } else if mode == Mode::Compose {
             self.editor.line_count().clamp(1, 10)
         } else {
             1
@@ -2784,8 +3350,13 @@ impl PromptApp {
             }
         }
         let status_w = self.text.measure_text(&status, false);
-        let suggestion = if mode == Mode::Compose {
+        let suggestion = if mode == Mode::Compose && !block_view {
             self.inline_suggestion()
+        } else {
+            None
+        };
+        let block_line = if block_view {
+            Some(self.block_status_line())
         } else {
             None
         };
@@ -2857,10 +3428,14 @@ impl PromptApp {
             );
 
             // Prompt glyph.
-            let (glyph, glyph_color) = match mode {
-                Mode::Compose => ("❯", theme.accent),
-                Mode::Running => ("●", theme.yellow),
-                Mode::Direct => ("!", theme.red),
+            let (glyph, glyph_color) = if block_view {
+                ("◆", theme.accent)
+            } else {
+                match mode {
+                    Mode::Compose => ("❯", theme.accent),
+                    Mode::Running => ("●", theme.yellow),
+                    Mode::Direct => ("!", theme.red),
+                }
             };
             painter.text(
                 text_x - prompt_w - s(10.0),
@@ -2875,7 +3450,18 @@ impl PromptApp {
         }
 
         // Editor / running line.
-        if mode == Mode::Compose {
+        if let Some((label, color)) = block_line {
+            painter.text(
+                text_x,
+                text_y,
+                &label,
+                color,
+                false,
+                None,
+                Clip::new(text_x, text_y, text_w, cell_h),
+                text_w,
+            );
+        } else if mode == Mode::Compose {
             draw_editor(
                 &mut painter,
                 &theme,
@@ -2963,21 +3549,29 @@ impl PromptApp {
             return;
         }
         let hint_clip = Clip::new(card_x + pad, hint_y, card_w - pad * 2.0, hint_h);
-        let long_hint = match mode {
-            Mode::Compose => {
-                if keys::is_macos() {
-                    "enter run   shift+enter newline   ↑↓ history   ⌘R search   ⌘V paste"
-                } else {
-                    "enter run   shift+enter newline   ↑↓ history   ^R search   ^V paste"
+        let long_hint = if block_view {
+            "esc exit   [ ] blocks   g/G top/bottom   e expand   / search   ↑↓ scroll"
+        } else {
+            match mode {
+                Mode::Compose => {
+                    if keys::is_macos() {
+                        "enter run   shift+enter newline   ↑↓ history   ⌘R search   ⌘V paste"
+                    } else {
+                        "enter run   shift+enter newline   ↑↓ history   ^R search   ^V paste"
+                    }
                 }
+                Mode::Running => "running — ctrl-c to interrupt   ctrl-shift-d background",
+                Mode::Direct => "this shell has no prompt integration; use zsh or bash",
             }
-            Mode::Running => "running — ctrl-c to interrupt   ctrl-shift-d background",
-            Mode::Direct => "this shell has no prompt integration; use zsh or bash",
         };
-        let short_hint = match mode {
-            Mode::Compose => "enter run   ↑ history   tab autocomplete",
-            Mode::Running => "running — ctrl-c stops   ctrl-shift-d background",
-            Mode::Direct => "classic input — zsh/bash enable the composer",
+        let short_hint = if block_view {
+            "esc exit   / search   e expand"
+        } else {
+            match mode {
+                Mode::Compose => "enter run   ↑ history   tab autocomplete",
+                Mode::Running => "running — ctrl-c stops   ctrl-shift-d background",
+                Mode::Direct => "classic input — zsh/bash enable the composer",
+            }
         };
         let hint_text_y = hint_y + (hint_h - cell_h) / 2.0 + s(1.0);
         let status_x = card_x + card_w - pad - status_w;
@@ -3181,6 +3775,83 @@ fn draw_editor(
 }
 
 impl PromptApp {
+    fn draw_block_bar(&mut self) {
+        let Some(view) = &self.block_view else {
+            return;
+        };
+        let index = view.index;
+        let expanded = view.expanded;
+        let total = self
+            .block_range(index)
+            .map(|(start, end)| end.saturating_sub(start) + 1)
+            .unwrap_or(0);
+        let shown = self
+            .block_window(index, expanded)
+            .map(|(start, end)| end.saturating_sub(start) + 1)
+            .unwrap_or(0);
+        let status = self.blocks.get(index).and_then(|block| block.status);
+        let search = view.search.as_ref().map(|search| {
+            (
+                search.query.clone(),
+                search.matches.len(),
+                search.selected,
+                search.active,
+            )
+        });
+
+        let mut text = format!(
+            "◆ block {}/{}  ·  {total} line{}",
+            index + 1,
+            self.blocks.len(),
+            if total == 1 { "" } else { "s" }
+        );
+        if shown < total {
+            text.push_str(&format!("  ·  {shown} shown"));
+        }
+        match status {
+            Some(0) => text.push_str("  ·  exit 0"),
+            Some(code) => text.push_str(&format!("  ·  exit {code}")),
+            None => text.push_str("  ·  running"),
+        }
+        if let Some((query, count, selected, active)) = search {
+            if active || count > 0 {
+                let current = if count == 0 { 0 } else { selected + 1 };
+                text.push_str(&format!("  ·  /{query} {current}/{count}"));
+            }
+        }
+
+        let cell_h = self.text.cell_h;
+        let scale = self.scale;
+        let grid = self.grid;
+        let theme = self.theme.clone();
+        let Some(canvas) = self.canvas.as_mut() else {
+            return;
+        };
+        let mut painter = Painter {
+            pixmap: canvas,
+            text: &mut self.text,
+            scale,
+        };
+        let text_w = painter.text.measure_text(&text, false);
+        let pad = 8.0 * scale;
+        let w = (text_w + pad * 2.0).min(grid.w).max(40.0 * scale);
+        let h = cell_h + 2.0 * scale;
+        let x = grid.x;
+        let y = (2.0 * scale).min((grid.y - h).max(1.0));
+        painter.rounded(x, y, w, h, 5.0 * scale, theme.panel_raised, 1.0);
+        painter.rounded_stroke(x, y, w, h, 5.0 * scale, scale.max(1.0), theme.border, 0.9);
+        painter.text(
+            x + pad,
+            y + (h - cell_h) / 2.0,
+            &text,
+            theme.dim,
+            false,
+            None,
+            Clip::new(x, y, w, h),
+            w - pad * 2.0,
+        );
+    }
+
     fn draw_background_panel(&mut self) {
         let panel = self.panel.clone();
         if panel.w <= 0.0 || self.background.is_empty() {
@@ -3199,7 +3870,10 @@ impl PromptApp {
             .background
             .iter()
             .map(|tab| {
-                let (status, color) = if tab.mode == Mode::Running {
+                let idle = tab.command.is_empty() && tab.mode != Mode::Running;
+                let (status, color) = if idle {
+                    ("idle".to_string(), theme.dim)
+                } else if tab.mode == Mode::Running {
                     (
                         format!("running · {:.1}s", tab.started.elapsed().as_secs_f32()),
                         theme.yellow,
@@ -3219,12 +3893,16 @@ impl PromptApp {
                     ("waiting".to_string(), theme.dim)
                 };
                 let command = if tab.command.is_empty() {
-                    "shell".to_string()
+                    format!("shell · {}", display_path(&tab.cwd))
                 } else {
                     tab.command.replace('\n', " ⏎ ")
                 };
                 let log = if tab.last_line.is_empty() {
-                    "no output yet".to_string()
+                    if idle {
+                        "ready".to_string()
+                    } else {
+                        "no output yet".to_string()
+                    }
                 } else {
                     tab.last_line.replace('\n', " ")
                 };
@@ -3709,12 +4387,7 @@ fn close_open_block(blocks: &mut [Block], session: &mut TerminalSession, status:
         return;
     }
     session.update_frame();
-    let row = session.scrollbar().offset
-        + session
-            .frame()
-            .cursor
-            .map(|cursor| cursor.y as u64)
-            .unwrap_or(0);
+    let row = session.scrollbar().total.saturating_sub(1);
     block.end_row = Some(row.max(block.start_row));
     block.status = status;
 }
@@ -3877,9 +4550,19 @@ impl ApplicationHandler<()> for PromptApp {
                 Ime::Commit(text) => {
                     self.ime_composing = false;
                     self.ime_preedit.clear();
-                    if !text.is_empty() && self.mode == Mode::Compose {
-                        self.editor.insert(&text);
-                        self.after_edit();
+                    if !text.is_empty() {
+                        if let Some(search) = self
+                            .block_view
+                            .as_mut()
+                            .and_then(|view| view.search.as_mut())
+                            .filter(|search| search.active)
+                        {
+                            search.query.push_str(&text);
+                            self.request_redraw();
+                        } else if self.mode == Mode::Compose {
+                            self.editor.insert(&text);
+                            self.after_edit();
+                        }
                     }
                 }
                 Ime::Preedit(text, _) => {

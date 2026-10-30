@@ -37,7 +37,9 @@ launch, right-click **Prompt.app**, choose **Open**, then confirm.
   to the composer when the shell prompt returns.
 - **Command blocks** — every submitted command is marked in the scrollback
   with its exit status. Scroll through earlier commands, or jump between
-  blocks with `Cmd/Ctrl+Shift+↑/↓`.
+  blocks with `Cmd/Ctrl+Shift+↑/↓`. Open a dedicated block view with
+  `Cmd/Ctrl+Shift+B`: long blocks show a 300-line window that expands on
+  demand, `g`/`G` snaps to the top or bottom, and `/` searches the block.
 - **Background commands** — push a long-running command into the side panel
   with the card's **background** button or `Cmd/Ctrl+Shift+D`. The panel shows
   the command, its elapsed time and last output line; click the entry to bring
@@ -142,6 +144,7 @@ Prompt is designed for both macOS and Linux. `Cmd` means `Cmd` on macOS and
 | Clear screen | `Cmd+K` | `Ctrl+L` |
 | Scroll terminal | `Shift+PageUp/Down`, wheel | same |
 | Previous / next command block | `Cmd+Shift+↑/↓` | `Ctrl+Shift+↑/↓` |
+| Open / close block view | `Cmd+Shift+B` | `Ctrl+Shift+B` |
 | Move running command to background | `Cmd+Shift+D` | `Ctrl+Shift+D` |
 | Fullscreen | `F11`, `Cmd+Ctrl+F` | `F11` |
 | Zoom font | `Cmd+=` / `Cmd+-` / `Cmd+0` | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
@@ -150,6 +153,10 @@ In the terminal grid: click and drag to select, double-click a word,
 triple-click a line, then copy. While a TUI has mouse reporting enabled,
 Prompt forwards clicks, releases and wheel events; hold `Shift` to select
 text instead.
+
+In block view: `[`/`]` moves between blocks, `g`/`G` snaps to the top or
+bottom, `e` expands a long block, `/` searches inside it, `n`/`N` walks the
+matches, and `Esc` returns to the terminal.
 
 ## Configuration
 

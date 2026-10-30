@@ -332,6 +332,11 @@ impl TerminalSession {
             session.install_colors(theme);
             let lines = scrollback_lines;
             session.set_opt(ffi::GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES, &lines);
+            // Ghostty also has a byte limit, and its default is small enough to
+            // prune long command output after a few hundred lines. Raise it so
+            // the configured line limit is what users actually see.
+            let bytes: usize = 128 * 1024 * 1024;
+            session.set_opt(ffi::GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES, &bytes);
             session.install_callbacks();
             session.resize(cols, rows, cell_w, cell_h);
             session.update_frame();
@@ -1129,6 +1134,23 @@ mod tests {
         term.write(b"\r\n");
         term.update_frame();
         assert_eq!(term.last_line(), "third");
+    }
+
+    #[test]
+    fn long_scrollback_is_not_pruned_early() {
+        let mut term = TerminalSession::new(&Theme::default(), 80, 24, 8, 16, 10_000).unwrap();
+        for i in 0..2000 {
+            term.write(format!("{i}\r\n").as_bytes());
+        }
+        term.update_frame();
+        assert!(
+            term.scrollbar().total > 1900,
+            "scrollback pruned to {} rows",
+            term.scrollbar().total
+        );
+        term.scroll_to_row(0);
+        term.update_frame();
+        assert_eq!(term.visible_text().lines().next(), Some("0"));
     }
 
     #[test]
