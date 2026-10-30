@@ -14,7 +14,7 @@ It's written in Rust and based on [libghostty](https://github.com/ghostty-org/gh
 
 No configuration, no setup. It just works.
 
-![Prompt screenshot](docs/screenshot.png)
+![Prompt demo: running commands in the editor-style composer, moving a command to the background panel, and browsing a block](docs/demo.gif)
 
 ## Download
 
