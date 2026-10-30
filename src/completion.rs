@@ -31,8 +31,87 @@ pub struct CompletionSet {
 
 pub struct CompletionEngine {
     commands: Vec<String>,
+    /// The curated command list, kept in priority order so inline suggestions
+    /// prefer common tools over whatever happens to sort first on PATH.
+    builtins: Vec<String>,
     loaded: Instant,
 }
+
+/// Common commands, in the order inline suggestions should prefer them.
+const BUILTINS: &[&str] = &[
+    "cd",
+    "pwd",
+    "ls",
+    "echo",
+    "cat",
+    "grep",
+    "rg",
+    "git",
+    "cargo",
+    "rustc",
+    "npm",
+    "pnpm",
+    "bun",
+    "yarn",
+    "node",
+    "python",
+    "python3",
+    "vim",
+    "nvim",
+    "nano",
+    "code",
+    "ssh",
+    "scp",
+    "curl",
+    "wget",
+    "mkdir",
+    "rm",
+    "mv",
+    "cp",
+    "touch",
+    "chmod",
+    "chown",
+    "tar",
+    "unzip",
+    "docker",
+    "kubectl",
+    "systemctl",
+    "brew",
+    "apt",
+    "pacman",
+    "yay",
+    "make",
+    "just",
+    "go",
+    "sed",
+    "awk",
+    "find",
+    "which",
+    "open",
+    "man",
+    "less",
+    "jq",
+    "tmux",
+    "htop",
+    "btop",
+    "top",
+    "kill",
+    "ps",
+    "df",
+    "du",
+    "env",
+    "export",
+    "source",
+    "alias",
+    "history",
+    "clear",
+    "exit",
+    "zsh",
+    "bash",
+    "fish",
+    "sudo",
+    "prompt",
+];
 
 impl Default for CompletionEngine {
     fn default() -> Self {
@@ -44,6 +123,7 @@ impl CompletionEngine {
     pub fn new() -> Self {
         let mut engine = Self {
             commands: Vec::new(),
+            builtins: Vec::new(),
             loaded: Instant::now() - Duration::from_secs(3600),
         };
         engine.refresh();
@@ -52,80 +132,7 @@ impl CompletionEngine {
 
     pub fn refresh(&mut self) {
         let mut set = BTreeSet::new();
-        for builtin in [
-            "cd",
-            "pwd",
-            "ls",
-            "echo",
-            "cat",
-            "grep",
-            "rg",
-            "git",
-            "cargo",
-            "rustc",
-            "npm",
-            "pnpm",
-            "bun",
-            "yarn",
-            "node",
-            "python",
-            "python3",
-            "vim",
-            "nvim",
-            "nano",
-            "code",
-            "ssh",
-            "scp",
-            "curl",
-            "wget",
-            "mkdir",
-            "rm",
-            "mv",
-            "cp",
-            "touch",
-            "chmod",
-            "chown",
-            "tar",
-            "unzip",
-            "docker",
-            "kubectl",
-            "systemctl",
-            "brew",
-            "apt",
-            "pacman",
-            "yay",
-            "make",
-            "just",
-            "go",
-            "sed",
-            "awk",
-            "find",
-            "which",
-            "open",
-            "man",
-            "less",
-            "jq",
-            "tmux",
-            "htop",
-            "btop",
-            "top",
-            "kill",
-            "ps",
-            "df",
-            "du",
-            "env",
-            "export",
-            "source",
-            "alias",
-            "history",
-            "clear",
-            "exit",
-            "zsh",
-            "bash",
-            "fish",
-            "sudo",
-            "prompt",
-        ] {
+        for builtin in BUILTINS {
             set.insert(builtin.to_string());
         }
         for dir in command_dirs() {
@@ -147,7 +154,33 @@ impl CompletionEngine {
             }
         }
         self.commands = set.into_iter().collect();
+        self.builtins = BUILTINS.iter().map(|s| (*s).to_string()).collect();
         self.loaded = Instant::now();
+    }
+
+    /// The first command on PATH that extends `text`, used for the inline
+    /// suggestion. Only call this for a single command token.
+    pub fn command_suggestion(&mut self, text: &str) -> Option<String> {
+        if text.is_empty()
+            || text.chars().any(char::is_whitespace)
+            || text.contains('/')
+            || text.starts_with('$')
+        {
+            return None;
+        }
+        if self.loaded.elapsed() > Duration::from_secs(30) {
+            self.refresh();
+        }
+        // If the token is already a complete command, adding more letters would
+        // feel like the editor is second-guessing the user.
+        if self.commands.iter().any(|command| command == text) {
+            return None;
+        }
+        self.builtins
+            .iter()
+            .chain(self.commands.iter())
+            .find(|command| command.len() > text.len() && command.starts_with(text))
+            .map(|command| command[text.len()..].to_string())
     }
 
     /// Compute completions for the token under `caret`.
@@ -389,6 +422,24 @@ pub fn common_prefix(items: &[Candidate]) -> String {
     prefix
 }
 
+/// Inline history suggestion ("ghost text") for the composer.
+///
+/// Only offered when the caret sits at the end of a single-line buffer, which
+/// keeps the preview unambiguous: it always occupies the space to the right of
+/// the caret and never covers existing text.
+pub fn history_suggestion(text: &str, caret: usize, history: &[String]) -> Option<String> {
+    if caret != text.len() || text.is_empty() || text.contains('\n') {
+        return None;
+    }
+    history.iter().rev().find_map(|entry| {
+        if entry.len() > text.len() && entry.starts_with(text) && !entry.contains('\n') {
+            Some(entry[text.len()..].to_string())
+        } else {
+            None
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,5 +492,45 @@ mod tests {
             },
         ];
         assert_eq!(common_prefix(&items), "cargo");
+    }
+
+    #[test]
+    fn inline_history_suggestion() {
+        let history = vec![
+            "cargo build".to_string(),
+            "git status".to_string(),
+            "git commit -m wip".to_string(),
+        ];
+        assert_eq!(
+            history_suggestion("git ", 4, &history).as_deref(),
+            Some("commit -m wip")
+        );
+        assert_eq!(
+            history_suggestion("git s", 5, &history).as_deref(),
+            Some("tatus")
+        );
+        assert_eq!(history_suggestion("git status", 10, &history), None);
+        assert_eq!(history_suggestion("git", 1, &history), None);
+    }
+
+    #[test]
+    fn inline_suggestion_requires_caret_at_end() {
+        let history = vec!["echo hello".to_string()];
+        assert_eq!(history_suggestion("echo", 2, &history), None);
+        assert_eq!(
+            history_suggestion("echo", 4, &history).as_deref(),
+            Some(" hello")
+        );
+    }
+
+    #[test]
+    fn command_suggestion_prefers_longer_prefix() {
+        let mut engine = CompletionEngine::new();
+        engine.builtins = vec!["cargo".into(), "cat".into(), "cd".into()];
+        engine.commands = vec!["cargo".into(), "cat".into(), "cd".into()];
+        assert_eq!(engine.command_suggestion("car").as_deref(), Some("go"));
+        assert_eq!(engine.command_suggestion("c"), Some("argo".into()));
+        assert_eq!(engine.command_suggestion("cargo"), None);
+        assert_eq!(engine.command_suggestion("cargo "), None);
     }
 }

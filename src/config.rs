@@ -56,6 +56,9 @@ impl Default for Behavior {
 #[serde(default)]
 pub struct Ui {
     pub show_hints: bool,
+    /// Show dim ghost text for the history/command completion that Tab (or
+    /// Right at the end of a line) will accept.
+    pub inline_suggestions: bool,
     pub start_maximized: bool,
     pub window_width: u32,
     pub window_height: u32,
@@ -65,6 +68,7 @@ impl Default for Ui {
     fn default() -> Self {
         Self {
             show_hints: true,
+            inline_suggestions: true,
             start_maximized: false,
             window_width: 1080,
             window_height: 700,
@@ -135,6 +139,8 @@ copy_on_select = false
 
 [ui]
 show_hints = true
+# Dim completion preview shown while typing, accepted with Tab.
+inline_suggestions = true
 start_maximized = false
 window_width = 1080
 window_height = 700

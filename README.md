@@ -29,9 +29,15 @@ launch, right-click **Prompt.app**, choose **Open**, then confirm.
 - **Editor-grade command entry** — selection, click-to-place caret, word and
   line movement, cut/copy/paste, undo/redo, smart Home, multiline commands,
   syntax highlighting.
+- **A calm first screen** — Prompt opens as a single command line centred in
+  the window. Running your first command slides it to the bottom and fades in
+  the terminal.
 - **Real terminal behaviour** — vim/nvim, less, top, ssh, tmux and other
   full-screen programs get the keyboard while they run. Prompt switches back
   to the composer when the shell prompt returns.
+- **Ghost autocomplete** — dim suggestions from history and `PATH` appear as
+  you type; `Tab` (or `Right` at the end of the line) accepts them. `Tab` with
+  no suggestion opens the full completion popup.
 - **Ghostty VT core** — true-colour, scrollback, alternate screen, wide
   characters and emoji, mouse reporting, bracketed paste, semantic prompts.
 - **Zero-config first run** — Prompt writes its config, shell integration and
@@ -39,8 +45,6 @@ launch, right-click **Prompt.app**, choose **Open**, then confirm.
   does not modify your dotfiles.
 - **History that is discoverable** — Up/Down recall and a filtered history
   search (`Cmd/Ctrl+R`) with a visual picker.
-- **Completion** — `Tab` completes commands from `PATH`, history and the
-  current directory, with a keyboard-driven popup.
 - **Themes and fonts** — opinionated dark theme, automatic monospace font
   selection, one `config.toml` to change them.
 
@@ -116,7 +120,8 @@ Prompt is designed for both macOS and Linux. `Cmd` means `Cmd` on macOS and
 | New line | `Shift+Enter` | `Shift+Enter` |
 | Previous / next history | `Up` / `Down` | `Up` / `Down` |
 | Search history | `Cmd+R` | `Ctrl+R` |
-| Complete | `Tab` / `Shift+Tab` | `Tab` / `Shift+Tab` |
+| Complete / accept suggestion | `Tab` / `Shift+Tab` | `Tab` / `Shift+Tab` |
+| Accept inline suggestion | `Right` at end of line | `Right` at end of line |
 | Copy | `Cmd+C` (or `Ctrl+Shift+C` in a running program) | `Ctrl+Shift+C` |
 | Paste | `Cmd+V` | `Ctrl+V` in the composer, `Ctrl+Shift+V` while a program runs |
 | Cut | `Cmd+X` | `Ctrl+X` |
@@ -155,6 +160,7 @@ copy_on_select = false
 
 [ui]
 show_hints = true
+inline_suggestions = true   # dim completion preview, accepted with Tab
 start_maximized = false
 window_width = 1080
 window_height = 700

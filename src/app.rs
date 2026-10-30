@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use arboard::Clipboard;
 use softbuffer::{Context, Surface};
-use tiny_skia::Pixmap;
+use tiny_skia::{Pixmap, PixmapPaint, Transform};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
@@ -13,7 +13,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-use crate::completion::{common_prefix, CompletionEngine, CompletionSet};
+use crate::completion::{common_prefix, history_suggestion, CompletionEngine, CompletionSet};
 use crate::config::{self, Config, Paths};
 use crate::editor::Editor;
 use crate::font::{Clip, Span, TextEngine};
@@ -127,6 +127,11 @@ pub struct PromptApp {
     welcome: bool,
     toast: Option<Toast>,
 
+    /// 0 = composer centred in an empty window, 1 = docked at the bottom with
+    /// the terminal revealed. Animated once, on the first submit.
+    dock_progress: f32,
+    dock_started: Option<Instant>,
+
     cursor_on: bool,
     last_blink: Instant,
 
@@ -239,6 +244,8 @@ impl PromptApp {
             completion_popup: None,
             welcome: first_run,
             toast: None,
+            dock_progress: if launch_integrated { 0.0 } else { 1.0 },
+            dock_started: None,
             cursor_on: true,
             last_blink: started,
             sel_anchor: None,
@@ -307,6 +314,36 @@ impl PromptApp {
         (logical * self.scale).round()
     }
 
+    /// Animate the composer from the centre of the window to its docked spot
+    /// at the bottom, revealing the terminal on the way.
+    fn begin_dock(&mut self) {
+        if self.dock_progress >= 1.0 || self.dock_started.is_some() {
+            return;
+        }
+        self.dock_started = Some(Instant::now());
+        self.request_redraw();
+    }
+
+    fn advance_dock(&mut self) {
+        let Some(started) = self.dock_started else {
+            return;
+        };
+        let t = (started.elapsed().as_secs_f32() / 0.34).clamp(0.0, 1.0);
+        // Ease-out cubic: quick departure, soft landing.
+        let eased = 1.0 - (1.0 - t).powi(3);
+        self.dock_progress = eased.max(self.dock_progress);
+        if t >= 1.0 {
+            self.dock_progress = 1.0;
+            self.dock_started = None;
+        }
+    }
+
+    /// Terminal opacity during the transition. The card starts moving first
+    /// and the terminal fades in underneath it.
+    fn terminal_reveal(&self) -> f32 {
+        ((self.dock_progress - 0.2) / 0.8).clamp(0.0, 1.0)
+    }
+
     fn init_surface(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
         let attrs = Window::default_attributes()
             .with_title("Prompt")
@@ -369,6 +406,7 @@ impl PromptApp {
                     self.launch.program, fallback.program
                 ));
                 self.mode = Mode::Direct;
+                self.dock_progress = 1.0;
                 self.launch.kind = ShellKind::Other;
                 self.launch.integrated = false;
                 self.launch.program = fallback.program.clone();
@@ -542,6 +580,7 @@ impl PromptApp {
                     if self.mode == Mode::Compose {
                         self.mode = Mode::Running;
                     }
+                    self.begin_dock();
                     self.running_started = Instant::now();
                     if !command.is_empty() {
                         self.running_cmd = command;
@@ -608,6 +647,7 @@ impl PromptApp {
 
         if !self.got_prompt && now > self.integration_deadline && self.mode == Mode::Compose {
             self.mode = Mode::Direct;
+            self.begin_dock();
             self.toast("Shell integration not detected — using classic input");
             self.request_redraw();
         }
@@ -659,6 +699,10 @@ impl PromptApp {
         }
         if let Some(toast) = &self.toast {
             next = next.min(toast.until);
+        }
+        if self.dock_started.is_some() {
+            self.request_redraw();
+            next = next.min(now + Duration::from_millis(16));
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(next));
     }
@@ -919,6 +963,8 @@ impl PromptApp {
         if code == KeyCode::Tab {
             if shift {
                 self.cycle_completion(true);
+            } else if self.completion_popup.is_none() && self.accept_inline_suggestion() {
+                return true;
             } else {
                 self.tab_complete();
             }
@@ -958,6 +1004,9 @@ impl PromptApp {
                 return true;
             }
             KeyCode::ArrowRight => {
+                if !extend && !word_mod && !line_mod && self.accept_inline_suggestion() {
+                    return true;
+                }
                 if word_mod {
                     self.editor.move_word_right(extend);
                 } else if line_mod {
@@ -1158,6 +1207,7 @@ impl PromptApp {
     // ---- submitting -------------------------------------------------------
 
     fn submit(&mut self) {
+        self.begin_dock();
         let text = self.editor.text().to_string();
         if text.trim().is_empty() {
             self.editor.clear();
@@ -1451,6 +1501,33 @@ impl PromptApp {
 
     // ---- completion -------------------------------------------------------
 
+    /// The dim preview shown after the caret. History wins over PATH so the
+    /// commands someone actually runs come back first.
+    fn inline_suggestion(&mut self) -> Option<String> {
+        if !self.config.ui.inline_suggestions || self.mode != Mode::Compose {
+            return None;
+        }
+        if self.editor.has_selection() {
+            return None;
+        }
+        let text = self.editor.text().to_string();
+        if text.is_empty() || self.editor.caret() != text.len() {
+            return None;
+        }
+        history_suggestion(&text, text.len(), self.history.entries())
+            .or_else(|| self.completion.command_suggestion(&text))
+    }
+
+    fn accept_inline_suggestion(&mut self) -> bool {
+        let Some(rest) = self.inline_suggestion() else {
+            return false;
+        };
+        self.editor.insert(&rest);
+        self.history_index = None;
+        self.after_edit();
+        true
+    }
+
     fn tab_complete(&mut self) {
         if self.completion_popup.is_some() {
             self.cycle_completion(false);
@@ -1705,7 +1782,8 @@ impl PromptApp {
     }
 
     fn mouse_in_grid(&self, x: f32, y: f32) -> bool {
-        x >= self.grid.x
+        self.dock_progress >= 0.999
+            && x >= self.grid.x
             && y >= self.grid.y
             && x < self.grid.x + self.grid.w
             && y < self.grid.y + self.grid.h
@@ -1859,6 +1937,7 @@ impl PromptApp {
         if surface.resize(w, h).is_err() {
             return;
         }
+        self.advance_dock();
         self.size = size;
         let scale = window.scale_factor() as f32;
         if (scale - self.scale).abs() > 0.001 {
@@ -1890,8 +1969,17 @@ impl PromptApp {
             self.draw_grid();
             self.grid_dirty = false;
         }
+        let reveal = self.terminal_reveal();
         if let (Some(canvas), Some(cache)) = (&mut self.canvas, &self.grid_cache) {
-            canvas.data_mut().copy_from_slice(cache.data());
+            if reveal >= 0.999 {
+                canvas.data_mut().copy_from_slice(cache.data());
+            } else if reveal > 0.0 {
+                let paint = PixmapPaint {
+                    opacity: reveal,
+                    ..PixmapPaint::default()
+                };
+                canvas.draw_pixmap(0, 0, cache.as_ref(), &paint, Transform::identity(), None);
+            }
         }
         self.draw_card();
         self.draw_welcome();
@@ -2112,10 +2200,15 @@ impl PromptApp {
         } else {
             1
         };
-        let card_h = (pad * 2.0 + lines as f32 * cell_h + s(6.0) + hint_h).max(self.card.h);
-        let card_y = height - margin - card_h;
-        let card_x = margin;
-        let card_w = (width - margin * 2.0).max(1.0);
+        let card_h = pad * 2.0 + lines as f32 * cell_h + s(6.0) + hint_h;
+        let dock = self.dock_progress.clamp(0.0, 1.0);
+        let docked_w = (width - margin * 2.0).max(1.0);
+        let centred_w = (760.0 * scale).min(docked_w);
+        let card_w = centred_w + (docked_w - centred_w) * dock;
+        let card_x = margin + (docked_w - card_w) / 2.0;
+        let docked_y = height - margin - card_h;
+        let centred_y = ((height - card_h) / 2.0).max(margin);
+        let card_y = centred_y + (docked_y - centred_y) * dock;
 
         let theme = self.theme.clone();
         let cwd_label = self.cwd_display();
@@ -2141,6 +2234,11 @@ impl PromptApp {
             }
         }
         let status_w = self.text.measure_text(&status, false);
+        let suggestion = if mode == Mode::Compose {
+            self.inline_suggestion()
+        } else {
+            None
+        };
 
         self.card = CardLayout {
             x: card_x,
@@ -2234,6 +2332,7 @@ impl PromptApp {
                 self.focus,
                 self.cursor_on,
                 &self.ime_preedit,
+                suggestion.as_deref(),
                 &mut self.hscroll,
                 &mut self.composer_scroll,
                 text_x,
@@ -2298,7 +2397,7 @@ impl PromptApp {
             Mode::Direct => "this shell has no prompt integration; use zsh or bash",
         };
         let short_hint = match mode {
-            Mode::Compose => "enter run   ↑ history   tab complete",
+            Mode::Compose => "enter run   ↑ history   tab autocomplete",
             Mode::Running => "running — ctrl-c stops",
             Mode::Direct => "classic input — zsh/bash enable the composer",
         };
@@ -2356,6 +2455,7 @@ fn draw_editor(
     focus: Focus,
     cursor_on: bool,
     preedit: &str,
+    suggestion: Option<&str>,
     hscroll: &mut usize,
     composer_scroll: &mut usize,
     x: f32,
@@ -2451,6 +2551,25 @@ fn draw_editor(
         );
     }
 
+    // Inline autocomplete: dim ghost text after the caret. Only single-line
+    // buffers at the end of the text produce a suggestion, so it never covers
+    // content the user has already typed.
+    if let Some(rest) = suggestion {
+        if preedit.is_empty() && caret_line == 0 {
+            let cx = x + (caret_col as f32 - *hscroll as f32) * cell_w;
+            painter.text(
+                cx,
+                y,
+                rest,
+                theme.faint,
+                false,
+                Some(cell_w),
+                text_clip,
+                (w - (cx - x)).max(10.0),
+            );
+        }
+    }
+
     // Caret.
     if focus == Focus::Composer && cursor_on {
         let cx = x + (caret_col as f32 - *hscroll as f32) * cell_w;
@@ -2485,14 +2604,16 @@ fn draw_editor(
 
 impl PromptApp {
     fn draw_welcome(&mut self) {
-        if !self.welcome {
+        if !self.welcome || self.dock_progress > 0.01 {
             return;
         }
         let Some(canvas) = self.canvas.as_mut() else {
             return;
         };
+        let width = self.size.width as f32;
+        let height = self.size.height as f32;
+        let card = self.card;
         let cell_h = self.text.cell_h;
-        let grid = self.grid;
         let scale = self.scale;
         let theme = self.theme.clone();
         let mut painter = Painter {
@@ -2500,67 +2621,31 @@ impl PromptApp {
             text: &mut self.text,
             scale: self.scale,
         };
-        painter.fill(grid.x, grid.y, grid.w, grid.h, theme.bg, 0.97);
-        let w = (grid.w * 0.72).clamp(460.0 * scale, 680.0 * scale);
-        let lines = 7.6;
-        let h = 52.0 * scale + lines * cell_h;
-        let x = grid.x + (grid.w - w) / 2.0;
-        let y = grid.y + (grid.h - h) / 2.0;
-        painter.rounded(x, y + 6.0 * scale, w, h, 14.0 * scale, theme.shadow, 0.6);
-        painter.rounded(x, y, w, h, 14.0 * scale, theme.panel, 1.0);
-        painter.rounded_stroke(x, y, w, h, 14.0 * scale, 1.0 * scale, theme.border, 0.9);
-        let pad = 26.0 * scale;
-        let mut ty = y + 22.0 * scale;
+        let clip = Clip::new(0.0, 0.0, width, height);
+        let title_y = (card.y - cell_h * 4.0).max(8.0 * scale);
+        let title = "Prompt";
+        let title_w = painter.text.measure_text(title, true);
         painter.text(
-            x + pad,
-            ty,
-            "Prompt",
+            (width - title_w) / 2.0,
+            title_y,
+            title,
             theme.accent,
             true,
             None,
-            Clip::new(x, y, w, h),
-            w - pad * 2.0,
+            clip,
+            width,
         );
-        ty += cell_h * 1.5;
+        let subtitle = "A terminal that types like an editor.";
+        let subtitle_w = painter.text.measure_text(subtitle, false);
         painter.text(
-            x + pad,
-            ty,
-            "A terminal that types like an editor.",
-            theme.fg,
-            false,
-            None,
-            Clip::new(x, y, w, h),
-            w - pad * 2.0,
-        );
-        ty += cell_h * 1.4;
-        let body = [
-            "Type below. Select with the mouse, copy and paste like a document.",
-            "Enter runs · Shift+Enter adds a line · Up recalls history · Tab completes.",
-            "vim, ssh, htop and every other program still get the whole keyboard.",
-            "Your existing zsh/bash configuration is loaded automatically.",
-        ];
-        for line in body {
-            painter.text(
-                x + pad,
-                ty,
-                line,
-                theme.dim,
-                false,
-                None,
-                Clip::new(x, y, w, h),
-                w - pad * 2.0,
-            );
-            ty += cell_h * 1.15;
-        }
-        painter.text(
-            x + pad,
-            y + h - 20.0 * scale,
-            "Press any key to start",
+            (width - subtitle_w) / 2.0,
+            title_y + cell_h * 1.5,
+            subtitle,
             theme.faint,
             false,
             None,
-            Clip::new(x, y, w, h),
-            w - pad * 2.0,
+            clip,
+            width,
         );
     }
 
