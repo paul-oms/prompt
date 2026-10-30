@@ -6,6 +6,10 @@
 
 **Prompt is a macOS/Linux terminal for people who enjoy polished, beautiful software.**
 
+> [!WARNING]
+> Prompt is **alpha software**. Expect rough edges, breaking changes and the
+> occasional crash. It is only for the brave right now.
+
 The command line is a proper text editor, and works precisely how you would expect it to work: click anywhere, drag
 to select, copy and paste with the shortcuts you already know, complete with syntax
 highlighting, multiline commands, history search, background terminals, and tab completion.
