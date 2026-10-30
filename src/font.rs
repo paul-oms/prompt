@@ -11,6 +11,8 @@ use cosmic_text::{
     Weight, Wrap,
 };
 use tiny_skia::Pixmap;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthChar;
 
 use crate::theme::Rgb;
 
@@ -172,6 +174,21 @@ impl TextEngine {
             .collect();
         buffer.set_rich_text(rich, &default_attrs, Shaping::Advanced, None);
 
+        // cosmic-text's `monospace_width` only snaps each advance to a multiple
+        // of the cell width, so rounding errors (and fallback faces chosen for
+        // bold/italic) leave glyphs off the grid. Long runs then drift into the
+        // next column, which shows up in columnar output like `ls`. Place every
+        // glyph on its own cell column instead.
+        let columns = monospace.filter(|width| *width > 0.0).and_then(|width| {
+            let line_text: String = spans.iter().map(|span| span.text.as_str()).collect();
+            // Byte offsets are line-relative once cosmic-text splits the
+            // text, so only snap single-line runs.
+            if line_text.contains('\n') {
+                return None;
+            }
+            Some(ColumnMap::new(&line_text, width))
+        });
+
         let mut glyphs: Vec<(cosmic_text::PhysicalGlyph, Rgb)> = Vec::new();
         let mut width: f32 = 0.0;
         {
@@ -185,7 +202,14 @@ impl TextEngine {
                         .color_opt
                         .map(|c| Rgb(c.r(), c.g(), c.b()))
                         .unwrap_or(Rgb(255, 255, 255));
-                    glyphs.push((glyph.physical((x, line_y), 1.0), color));
+                    let glyph_x = match &columns {
+                        // Column placement assumes left-to-right text.
+                        Some(columns) if !run.rtl => {
+                            x + columns.column(glyph.start) as f32 * columns.width
+                        }
+                        _ => x + glyph.x,
+                    };
+                    glyphs.push((glyph.physical((glyph_x - glyph.x, line_y), 1.0), color));
                 }
             }
         }
@@ -310,6 +334,50 @@ impl TextEngine {
     }
 }
 
+/// Maps byte offsets in a line of text to display columns, so text drawn with a
+/// fixed cell width lands exactly on the grid.
+struct ColumnMap {
+    width: f32,
+    /// `(byte offset, display column)` at each grapheme boundary.
+    stops: Vec<(usize, usize)>,
+}
+
+impl ColumnMap {
+    fn new(text: &str, width: f32) -> Self {
+        let mut stops = Vec::with_capacity(text.len() + 1);
+        stops.push((0, 0));
+        let mut offset = 0;
+        let mut column = 0;
+        for grapheme in text.graphemes(true) {
+            offset += grapheme.len();
+            column += grapheme_width(grapheme);
+            stops.push((offset, column));
+        }
+        Self { width, stops }
+    }
+
+    fn column(&self, byte: usize) -> usize {
+        match self.stops.binary_search_by(|probe| probe.0.cmp(&byte)) {
+            Ok(index) => self.stops[index].1,
+            Err(0) => 0,
+            Err(index) => self.stops[index - 1].1,
+        }
+    }
+}
+
+fn grapheme_width(grapheme: &str) -> usize {
+    grapheme
+        .chars()
+        .map(|ch| {
+            if ch == '\t' {
+                4
+            } else {
+                UnicodeWidthChar::width(ch).unwrap_or(0)
+            }
+        })
+        .sum()
+}
+
 fn family_ref(family: &str) -> Family<'_> {
     if family.eq_ignore_ascii_case("monospace") {
         Family::Monospace
@@ -374,6 +442,44 @@ fn blend_rgba(dst: &mut [u8], src: [u8; 4]) {
 mod tests {
     use super::*;
     use tiny_skia::Pixmap;
+
+    /// Long runs must land on the cell grid: a drift of even a fraction of a
+    /// pixel per glyph pushes columnar output (e.g. `ls`) into the next column.
+    #[test]
+    fn monospace_glyphs_stay_on_the_grid() {
+        let mut engine = TextEngine::new(1.0, "", 14.0, 1.38);
+        let cell_w = 8.0;
+        let cols = 20;
+        let mut pixmap = Pixmap::new(400, 40).unwrap();
+        pixmap.fill(tiny_skia::Color::BLACK);
+        let spans = vec![Span {
+            text: "M".repeat(cols),
+            color: Rgb(255, 255, 255),
+            bold: false,
+            italic: false,
+        }];
+        engine.draw_line(
+            &mut pixmap,
+            0.0,
+            0.0,
+            &spans,
+            Some(cell_w),
+            Clip::new(0.0, 0.0, 400.0, 40.0),
+            400.0,
+        );
+        let max_x = pixmap
+            .data()
+            .chunks_exact(4)
+            .enumerate()
+            .filter(|(_, p)| p[0] > 20 || p[1] > 20 || p[2] > 20)
+            .map(|(i, _)| (i % 400) as f32)
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_x < cols as f32 * cell_w + 2.0,
+            "text extends to {max_x}px, past the {}th cell",
+            cols
+        );
+    }
 
     #[test]
     fn draws_cjk_and_emoji() {
