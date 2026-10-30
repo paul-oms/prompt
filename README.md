@@ -4,17 +4,17 @@
 
 # Prompt
 
-**A terminal that types like an editor.**
+**A terminal that works they way you expect it to.**
 
-Prompt is a macOS/Linux terminal for people who live in AI-assisted
-development but still need a real shell. It looks like a terminal, but the
-command line is a proper text editor: click anywhere to place the caret, drag
-to select, copy and paste with the shortcuts you already know, syntax
-highlighting, multiline commands, history search and completion.
+Prompt is a macOS/Linux terminal for people who enjoy polished, beautiful software.
 
-The terminal engine is [Ghostty's `libghostty-vt`](https://github.com/ghostty-org/ghostty).
-Prompt embeds it directly, so VT parsing, scrollback, selection, key encoding
-and semantic prompt tracking are Ghostty's, not a reimplementation.
+The command line is a proper text editor, and works how you expect something you put text into to work: click anywhere, drag
+to select, copy and paste with the shortcuts you already know, complete with syntax
+highlighting, multiline commands, history search, background terminals, and tab completion.
+
+It's written in Rust and based on [libghostty](https://github.com/ghostty-org/ghostty) so it's fast and bloat free.
+
+No configuration, no setup. It just works.
 
 ![Prompt screenshot](docs/screenshot.png)
 
@@ -28,41 +28,6 @@ Release builds support the two latest macOS versions on Apple Silicon:
 The DMGs are ad-hoc signed but not notarized yet. If macOS blocks the first
 launch, right-click **Prompt.app**, choose **Open**, then confirm.
 
-## What works
-
-- **Editor-grade command entry** — selection, click-to-place caret, word and
-  line movement, cut/copy/paste, undo/redo, smart Home, multiline commands,
-  syntax highlighting.
-- **A calm first screen** — Prompt opens as a single command line centred in
-  the window. Running your first command slides it to the bottom and fades in
-  the terminal.
-- **Real terminal behaviour** — vim/nvim, less, top, ssh, tmux and other
-  full-screen programs get the keyboard while they run. Prompt switches back
-  to the composer when the shell prompt returns.
-- **Command blocks** — every submitted command is marked in the scrollback
-  with its exit status. Scroll through earlier commands, or jump between
-  blocks with `Cmd/Ctrl+Shift+↑/↓`. Open a dedicated block view with
-  `Cmd/Ctrl+Shift+B`: long blocks show a 300-line window that expands on
-  demand, `g`/`G` snaps to the top or bottom, and `/` searches the block.
-- **Background commands** — push a long-running command into the side panel
-  with the card's **background** button or `Cmd/Ctrl+Shift+D`. The panel shows
-  the command, its elapsed time and last output line; scroll the list with the
-  mouse wheel when there are more tabs than fit. Click the entry to bring it
-  back, or the **×** to stop it.
-- **Ghost autocomplete** — dim suggestions from history and `PATH` appear as
-  you type; `Right` at the end of the line accepts them. `Tab` completes the
-  token, or opens the full completion popup when several candidates match;
-  move through the list with `Up`/`Down` (or `Shift+Tab`/`Tab`) and accept with
-  `Enter`.
-- **Ghostty VT core** — true-colour, scrollback, alternate screen, wide
-  characters and emoji, mouse reporting, bracketed paste, semantic prompts.
-- **Zero-config first run** — Prompt writes its config, shell integration and
-  history files itself. It sources your existing zsh/bash configuration; it
-  does not modify your dotfiles.
-- **History that is discoverable** — Up/Down recall and a filtered history
-  search (`Cmd/Ctrl+R`) with a visual picker.
-- **Themes and fonts** — opinionated dark theme, automatic monospace font
-  selection, one `config.toml` to change them.
 
 ## Install / run
 
@@ -189,37 +154,6 @@ window_width = 1080
 window_height = 700
 ```
 
-## How it works
-
-```
-src/
-  app.rs        window, layout, input state machine, composer UI
-  editor.rs     grapheme-aware text editor model (selection, undo, motion)
-  term.rs       safe wrapper around libghostty-vt
-  pty.rs        shell process + pseudo-terminal I/O
-  shell.rs      zero-config shell discovery and integration shims
-  font.rs       font discovery, shaping, glyph rasterisation
-  render.rs     tiny-skia painter
-  highlight.rs  shell syntax highlighting
-  completion.rs PATH/history/filesystem completion
-  history.rs    persistent, JSONL command history
-  keys.rs       winit → Ghostty key encoding
-```
-
-Key design decisions:
-
-- **Ghostty is the terminal.** `libghostty-vt` owns the grid, scrollback,
-  screens, selection and VT parser. Prompt draws its render state.
-- **The composer is the source of truth at the prompt.** Keys are not forwarded
-  character-by-character; Prompt edits a real text buffer and sends the
-  completed line on Enter. Shell prompt markers (OSC 133) tell Prompt when the
-  shell is ready for input versus when a command owns the keyboard.
-- **Your shell stays your shell.** Prompt launches a normal interactive
-  zsh/bash with a shim `ZDOTDIR`/`--rcfile` that sources your real config and
-  adds two hooks. Aliases, functions, version managers and prompts keep working.
-- **No GPU required.** Rendering is CPU-side immediately-mode drawing with
-  cosmic-text shaping; frames are only produced when something changes.
-
 ## Testing
 
 ```sh
@@ -239,20 +173,6 @@ DISPLAY=:99 PROMPT_SCREENSHOT=/tmp/shot.png PROMPT_EXIT_AFTER_SCREENSHOT=1 \
 # run a command automatically after the first prompt
 PROMPT_AUTOTYPE='echo hello' PROMPT_AUTOTYPE_DELAY=1200 ...
 ```
-
-## Roadmap
-
-The prioritized backlog lives in [BACKLOG.md](BACKLOG.md). The current
-sequence is:
-
-1. **Daily driver** — macOS validation, IME polish, integration diagnostics,
-   UI smoke tests, inline history suggestions.
-2. **Legible terminal** — command blocks, history panel, command palette,
-   shell-aware completion.
-3. **Agent-aware** — detect Claude Code/Codex/OpenCode sessions, explain and
-   fix failures, natural-language commands with a review step.
-4. **Installable product** — Homebrew, Linux packages, signed macOS bundle,
-   website and diagnostics.
 
 ## Third-party
 
