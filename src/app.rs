@@ -2193,13 +2193,6 @@ impl PromptApp {
                 self.grid_dirty = true;
             }
         }
-        if let Some(session) = &mut self.session {
-            if !session.frame().scrollbar.at_bottom() {
-                session.scroll_to_bottom();
-                session.update_frame();
-                self.grid_dirty = true;
-            }
-        }
         self.composer_scroll_to_caret();
         self.sync_composer_layout();
         self.request_redraw();
