@@ -22,9 +22,9 @@ No configuration, no setup. It just works.
 
 ![Prompt demo: GPU-accelerated rendering with wgpu, showing a command, split panes, a background tab and block view](docs/demo.gif)
 
-*The demo is painted live by Prompt's GPU path: run a command in the composer, split the pane, start a live command
-in the second pane, park it in the background panel, then open block view beside it. The title strip is part of the
-recording.*
+*The demo is painted live by Prompt's GPU path: the composer docks to the bottom when the first command runs, the
+pane splits, a live command is parked in the background panel, then block view opens beside it. The title strip is
+part of the recording.*
 
 **Highlights**
 
@@ -201,7 +201,8 @@ usable adapter.
 
 For troubleshooting, `PROMPT_RENDER=cpu` or `PROMPT_RENDER=gpu` overrides the
 config for a single run, and Prompt prints the chosen adapter to stderr at
-startup.
+startup. On X11, `PROMPT_PRESENT=immediate` bypasses vsync; it is useful for
+low-latency sessions and screen recordings.
 
 [`scripts/demo.sh`](scripts/demo.sh) is a small GPU stress sequence for local
 testing: coloured scrollback followed by a full-screen truecolour animation.

@@ -333,7 +333,14 @@ impl Renderer {
             .or_else(|| caps.formats.first().copied())?;
         let mut config = surface.get_default_config(&adapter, width, height)?;
         config.format = format;
-        config.present_mode = wgpu::PresentMode::AutoVsync;
+        let requested_present = match std::env::var("PROMPT_PRESENT").as_deref() {
+            Ok("immediate") => Some(wgpu::PresentMode::Immediate),
+            Ok("mailbox") => Some(wgpu::PresentMode::Mailbox),
+            _ => None,
+        };
+        config.present_mode = requested_present
+            .filter(|mode| caps.present_modes.contains(mode))
+            .unwrap_or(wgpu::PresentMode::AutoVsync);
         // Draw sRGB-encoded values straight into a non-sRGB view: colours then
         // match the tiny-skia output pixel for pixel instead of picking up an
         // extra linearisation round trip.
