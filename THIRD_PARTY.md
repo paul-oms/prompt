@@ -7,7 +7,9 @@ components; Prompt's own code is MIT (see `LICENSE`).
 | --- | --- | --- |
 | [Ghostty / libghostty-vt](https://github.com/ghostty-org/ghostty) | VT parsing, screens, scrollback, selection, key encoding | MIT |
 | [winit](https://github.com/rust-windowing/winit) | Window and input | Apache-2.0 / MIT |
-| [softbuffer](https://github.com/rust-windowing/softbuffer) | CPU frame presentation | Apache-2.0 / MIT |
+| [wgpu](https://github.com/gfx-rs/wgpu) | GPU rendering (Vulkan / Metal) | Apache-2.0 / MIT |
+| [softbuffer](https://github.com/rust-windowing/softbuffer) | CPU frame presentation fallback | Apache-2.0 / MIT |
+| [bytemuck](https://github.com/Lokathor/bytemuck) | GPU instance data | Apache-2.0 / MIT / Zlib |
 | [cosmic-text](https://github.com/pop-os/cosmic-text) | Font discovery, shaping, glyph rasterisation | Apache-2.0 / MIT |
 | [tiny-skia](https://github.com/RazrFalcon/tiny-skia) | 2D rasterisation | BSD-3-Clause |
 | [portable-pty](https://github.com/wez/wezterm/tree/main/pty) | Pseudo-terminal process I/O | MIT |

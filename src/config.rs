@@ -10,6 +10,7 @@ pub struct Config {
     pub appearance: Appearance,
     pub behavior: Behavior,
     pub ui: Ui,
+    pub render: Render,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -72,6 +73,23 @@ impl Default for Ui {
             start_maximized: false,
             window_width: 1080,
             window_height: 700,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct Render {
+    /// `auto` tries the GPU and falls back to the CPU renderer, `gpu` asks for
+    /// the GPU (still falling back if unavailable), and `cpu` forces software
+    /// rendering.
+    pub backend: String,
+}
+
+impl Default for Render {
+    fn default() -> Self {
+        Self {
+            backend: "auto".into(),
         }
     }
 }
@@ -144,6 +162,10 @@ inline_suggestions = true
 start_maximized = false
 window_width = 1080
 window_height = 700
+
+[render]
+# auto (GPU when available), gpu, or cpu.
+backend = "auto"
 "#;
 
 /// Load config, creating the config directory and a commented default file on
@@ -191,6 +213,11 @@ fn sanitize(mut cfg: Config) -> Config {
     cfg.behavior.scrollback_lines = cfg.behavior.scrollback_lines.clamp(100, 1_000_000);
     cfg.ui.window_width = cfg.ui.window_width.clamp(480, 8000);
     cfg.ui.window_height = cfg.ui.window_height.clamp(320, 6000);
+    cfg.render.backend = match cfg.render.backend.trim().to_ascii_lowercase().as_str() {
+        "gpu" => "gpu".into(),
+        "cpu" => "cpu".into(),
+        _ => "auto".into(),
+    };
     cfg
 }
 

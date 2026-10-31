@@ -14,11 +14,22 @@ The command line is a proper text editor, and works precisely how you would expe
 to select, copy and paste with the shortcuts you already know, complete with syntax
 highlighting, multiline commands, history search, background terminals, and tab completion.
 
-It's written in Rust and based on [libghostty](https://github.com/ghostty-org/ghostty) so it's fast and bloat free.
+It's written in Rust and based on [libghostty](https://github.com/ghostty-org/ghostty). **Rendering is
+GPU-accelerated** with [wgpu](https://wgpu.rs): glyphs, colours, cursor and chrome paint directly on the GPU, and a
+software renderer takes over automatically when no usable adapter is present.
 
 No configuration, no setup. It just works.
 
-![Prompt demo: running commands in two split panes, resizing and zooming them, and parking a running command in the shared background panel](docs/demo.gif)
+![Prompt demo: GPU-accelerated rendering with wgpu, showing coloured scrollback and a smooth truecolour animation](docs/demo.gif)
+
+*Every frame above is painted by Prompt's GPU path — fast coloured scrollback, then a smooth truecolour animation.
+The title strip is part of the recording.*
+
+**Highlights**
+
+- **GPU rendering** — instanced glyphs and rectangles in one wgpu pass, with automatic CPU fallback.
+- **Editor-grade composer** — click-to-edit, multiline commands, history search and tab completion.
+- **Splits and background tabs** — run an agent and a shell side by side, or park long-running work.
 
 ## Download
 
@@ -89,8 +100,8 @@ and network access. `src/ghostty_bindings.rs` is pre-generated from the
 vendored headers; regenerate it with bindgen if you change the Ghostty
 version.
 
-On macOS the same Rust stack is used (winit + softbuffer + cosmic-text); only
-the Ghostty static library needs a macOS build.
+On macOS the same Rust stack is used (winit + wgpu + cosmic-text); only the
+Ghostty static library needs a macOS build.
 
 ## Keyboard
 
@@ -167,7 +178,33 @@ inline_suggestions = true   # dim completion preview, accepted with Tab
 start_maximized = false
 window_width = 1080
 window_height = 700
+
+[render]
+backend = "auto"      # auto (GPU when available), gpu, or cpu
 ```
+
+## GPU rendering
+
+Prompt paints rectangles and glyphs directly on the GPU through wgpu (Vulkan on
+Linux, Metal on macOS). Glyph masks and colour emoji live in a shared atlas;
+rectangles, borders and text are uploaded as instance data and drawn in a single
+ordered pass, so the GPU handles the per-frame work while the CPU only lays out
+changed text. The software renderer remains as a fallback for machines without a
+usable adapter.
+
+- `backend = "auto"` (the default) uses the GPU when one is available and falls
+  back to software.
+- `backend = "gpu"` asks for the GPU explicitly; if initialisation fails Prompt
+  still starts with the software renderer.
+- `backend = "cpu"` forces the tiny-skia/softbuffer path.
+
+For troubleshooting, `PROMPT_RENDER=cpu` or `PROMPT_RENDER=gpu` overrides the
+config for a single run, and Prompt prints the chosen adapter to stderr at
+startup.
+
+The README demo is reproducible: [`scripts/demo.sh`](scripts/demo.sh) contains
+the scripted sequence, and `PROMPT_RENDER=gpu` forces the GPU path when
+recording.
 
 ## Testing
 

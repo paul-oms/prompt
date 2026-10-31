@@ -1,11 +1,12 @@
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use arboard::Clipboard;
 use softbuffer::{Context, Surface};
-use tiny_skia::{Pixmap, PixmapPaint, Transform};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
@@ -17,11 +18,12 @@ use crate::completion::{common_prefix, history_suggestion, CompletionEngine, Com
 use crate::config::{self, Config, Paths};
 use crate::editor::Editor;
 use crate::font::{Clip, Span, TextEngine};
+use crate::gpu::{GlyphAtlas, Renderer};
 use crate::highlight;
 use crate::history::History;
 use crate::keys;
 use crate::pty::Pty;
-use crate::render::Painter;
+use crate::render::{Canvas, Painter};
 use crate::shell::{self, ShellKind, ShellLaunch};
 use crate::term::{CursorStyle, TermEvent, TerminalSession};
 use crate::theme::{Rgb, Theme};
@@ -368,11 +370,13 @@ pub struct PromptApp {
     window: Option<Arc<Window>>,
     context: Option<Context<Arc<Window>>>,
     surface: Option<Surface<Arc<Window>, Arc<Window>>>,
+    gpu: Option<Renderer>,
+    atlas: Option<Rc<RefCell<GlyphAtlas>>>,
     proxy: Option<EventLoopProxy<()>>,
 
     text: TextEngine,
-    canvas: Option<Pixmap>,
-    grid_cache: Option<Pixmap>,
+    canvas: Option<Canvas>,
+    grid_cache: Option<Canvas>,
     grid_dirty: bool,
     size: PhysicalSize<u32>,
     scale: f32,
@@ -520,6 +524,8 @@ impl PromptApp {
             window: None,
             context: None,
             surface: None,
+            gpu: None,
+            atlas: None,
             proxy: Some(proxy),
             text,
             canvas: None,
@@ -697,11 +703,36 @@ impl PromptApp {
             self.config.appearance.font_size,
             self.config.appearance.line_height,
         );
-        let context = Context::new(window.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let surface = Surface::new(&context, window.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // `PROMPT_RENDER` overrides the config for smoke tests.
+        let backend =
+            std::env::var("PROMPT_RENDER").unwrap_or_else(|_| self.config.render.backend.clone());
+        let can_use_gpu = !backend.eq_ignore_ascii_case("cpu");
+        if can_use_gpu {
+            let size = window.inner_size();
+            match Renderer::new(
+                window.clone(),
+                Some(event_loop.owned_display_handle()),
+                size.width,
+                size.height,
+            ) {
+                Some(renderer) => {
+                    self.atlas = Some(renderer.atlas());
+                    self.gpu = Some(renderer);
+                }
+                None => {
+                    eprintln!("prompt: GPU renderer unavailable, using software rendering");
+                }
+            }
+        }
+        if self.gpu.is_none() {
+            let context = Context::new(window.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let surface =
+                Surface::new(&context, window.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
+            self.context = Some(context);
+            self.surface = Some(surface);
+        }
         window.set_ime_allowed(true);
-        self.context = Some(context);
-        self.surface = Some(surface);
         self.window = Some(window);
         self.size = self.window.as_ref().unwrap().inner_size();
 
@@ -2728,12 +2759,16 @@ impl PromptApp {
         event_loop.set_control_flow(ControlFlow::WaitUntil(next));
     }
 
-    fn save_screenshot(&self, path: &Path) {
-        if let Some(canvas) = &self.canvas {
+    fn save_screenshot(&mut self, path: &Path) {
+        if let Some(gpu) = &mut self.gpu {
+            if let Some(canvas) = &self.canvas {
+                gpu.screenshot(canvas.scene(), path);
+            }
+        } else if let Some(canvas) = &self.canvas {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let _ = canvas.save_png(path);
+            canvas.save_png(path);
         }
     }
 
@@ -4325,20 +4360,23 @@ impl PromptApp {
         let Some(window) = self.window.clone() else {
             return;
         };
-        let Some(surface) = &mut self.surface else {
-            return;
-        };
         let size = window.inner_size();
         if size.width == 0 || size.height == 0 {
             return;
         }
-        let (Some(w), Some(h)) = (
-            std::num::NonZeroU32::new(size.width),
-            std::num::NonZeroU32::new(size.height),
-        ) else {
-            return;
-        };
-        if surface.resize(w, h).is_err() {
+        if let Some(gpu) = &mut self.gpu {
+            gpu.resize(size.width, size.height);
+        } else if let Some(surface) = &mut self.surface {
+            let (Some(w), Some(h)) = (
+                std::num::NonZeroU32::new(size.width),
+                std::num::NonZeroU32::new(size.height),
+            ) else {
+                return;
+            };
+            if surface.resize(w, h).is_err() {
+                return;
+            }
+        } else {
             return;
         }
         self.advance_dock();
@@ -4355,12 +4393,12 @@ impl PromptApp {
             .map(|c| c.width() != size.width || c.height() != size.height)
             .unwrap_or(true);
         if size_changed {
-            self.canvas = Pixmap::new(size.width, size.height);
-            self.grid_cache = Pixmap::new(size.width, size.height);
+            self.canvas = Canvas::new(size.width, size.height, self.atlas.clone());
+            self.grid_cache = Canvas::new(size.width, size.height, self.atlas.clone());
             self.grid_dirty = true;
         }
         if let Some(canvas) = &mut self.canvas {
-            canvas.fill(self.theme.bg.solid());
+            canvas.fill(self.theme.bg);
         } else {
             return;
         }
@@ -4385,22 +4423,14 @@ impl PromptApp {
         let split_mode = self.panes.len() > 1 || self.zoomed_pane.is_some();
         if self.grid_dirty {
             if let Some(cache) = &mut self.grid_cache {
-                cache.fill(self.theme.bg.solid());
+                cache.fill(self.theme.bg);
             }
             self.paint_panes_into_cache(split_mode);
             self.grid_dirty = false;
         }
         let reveal = self.terminal_reveal();
         if let (Some(canvas), Some(cache)) = (&mut self.canvas, &self.grid_cache) {
-            if reveal >= 0.999 {
-                canvas.data_mut().copy_from_slice(cache.data());
-            } else if reveal > 0.0 {
-                let paint = PixmapPaint {
-                    opacity: reveal,
-                    ..PixmapPaint::default()
-                };
-                canvas.draw_pixmap(0, 0, cache.as_ref(), &paint, Transform::identity(), None);
-            }
+            canvas.compose(cache, reveal);
         }
         if split_mode {
             self.draw_split_chrome();
@@ -4416,22 +4446,30 @@ impl PromptApp {
         self.draw_completion();
         self.draw_toast();
 
-        let Some(canvas) = self.canvas.as_ref() else {
-            return;
-        };
-        let Some(surface) = &mut self.surface else {
-            return;
-        };
-
         // Present.
-        let Ok(mut buffer) = surface.buffer_mut() else {
-            return;
-        };
-        let pixels = canvas.data();
-        for (i, chunk) in pixels.chunks_exact(4).enumerate() {
-            buffer[i] = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | chunk[2] as u32;
+        if let Some(gpu) = &mut self.gpu {
+            let Some(canvas) = self.canvas.as_ref() else {
+                return;
+            };
+            gpu.render(canvas.scene());
+        } else {
+            let Some(canvas) = self.canvas.as_ref() else {
+                return;
+            };
+            let Some(pixmap) = canvas.pixmap() else {
+                return;
+            };
+            let Some(surface) = &mut self.surface else {
+                return;
+            };
+            let Ok(mut buffer) = surface.buffer_mut() else {
+                return;
+            };
+            for (i, chunk) in pixmap.data().chunks_exact(4).enumerate() {
+                buffer[i] = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | chunk[2] as u32;
+            }
+            let _ = buffer.present();
         }
-        let _ = buffer.present();
         self.last_frame = Instant::now();
     }
 
@@ -4448,7 +4486,7 @@ impl PromptApp {
             return;
         };
         let mut painter = Painter {
-            pixmap: cache,
+            canvas: cache,
             text: &mut self.text,
             scale,
         };
@@ -4600,7 +4638,7 @@ impl PromptApp {
             return;
         };
         let mut painter = Painter {
-            pixmap: canvas,
+            canvas,
             text: &mut self.text,
             scale,
         };
@@ -4712,7 +4750,7 @@ impl PromptApp {
             return;
         };
         let mut painter = Painter {
-            pixmap: canvas,
+            canvas,
             text: &mut self.text,
             scale,
         };
@@ -4860,7 +4898,7 @@ impl PromptApp {
             return;
         };
         let mut painter = Painter {
-            pixmap: canvas,
+            canvas,
             text: &mut self.text,
             scale,
         };
@@ -5068,7 +5106,7 @@ impl PromptApp {
             return;
         };
         let mut painter = Painter {
-            pixmap: canvas,
+            canvas,
             text: &mut self.text,
             scale,
         };
@@ -5391,8 +5429,7 @@ fn draw_editor(
             continue;
         }
         let spans = highlight::line_spans(&text, theme);
-        painter.text.draw_line(
-            painter.pixmap,
+        painter.spans(
             x - *hscroll as f32 * cell_w,
             ly,
             &spans,
@@ -5521,7 +5558,7 @@ impl PromptApp {
             return;
         };
         let mut painter = Painter {
-            pixmap: canvas,
+            canvas,
             text: &mut self.text,
             scale,
         };
@@ -5614,7 +5651,7 @@ impl PromptApp {
             return;
         };
         let mut painter = Painter {
-            pixmap: canvas,
+            canvas,
             text: &mut self.text,
             scale,
         };
@@ -5799,7 +5836,7 @@ impl PromptApp {
         let scale = self.scale;
         let theme = self.theme.clone();
         let mut painter = Painter {
-            pixmap: canvas,
+            canvas,
             text: &mut self.text,
             scale: self.scale,
         };
@@ -5849,7 +5886,7 @@ impl PromptApp {
         let h = pad * 2.0 + header_h + visible as f32 * cell_h + 4.0 * scale;
         let y = (card.y - h - 10.0 * scale).max(self.grid.y + 4.0 * scale);
         let mut painter = Painter {
-            pixmap: canvas,
+            canvas,
             text: &mut self.text,
             scale: self.scale,
         };
@@ -5955,7 +5992,7 @@ impl PromptApp {
         let h = pad * 2.0 + visible as f32 * cell_h;
         let y = (card.y - h - 10.0 * scale).max(self.grid.y + 4.0 * scale);
         let mut painter = Painter {
-            pixmap: canvas,
+            canvas,
             text: &mut self.text,
             scale: self.scale,
         };
@@ -6012,7 +6049,7 @@ impl PromptApp {
         let theme = self.theme.clone();
         let card = self.card;
         let mut painter = Painter {
-            pixmap: canvas,
+            canvas,
             text: &mut self.text,
             scale: self.scale,
         };
@@ -6668,15 +6705,7 @@ fn draw_run_at(
         bold: run.style.bold,
         italic: run.style.italic,
     };
-    painter.text.draw_line(
-        painter.pixmap,
-        x,
-        y_top,
-        &[span],
-        Some(cell_w),
-        *clip,
-        100_000.0,
-    );
+    painter.spans(x, y_top, &[span], Some(cell_w), *clip, 100_000.0);
     if run.style.underline || run.style.strikethrough || run.style.overline {
         let width = (run.end_x - run.x) as f32 * cell_w;
         let color = run.style.underline_color.unwrap_or(run.style.fg);

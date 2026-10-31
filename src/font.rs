@@ -7,8 +7,8 @@
 use std::collections::HashSet;
 
 use cosmic_text::{
-    Attrs, Buffer, Family, FontSystem, Hinting, Metrics, Shaping, Style, SwashCache, SwashContent,
-    Weight, Wrap,
+    Attrs, Buffer, CacheKey, Family, FontSystem, Hinting, Metrics, PhysicalGlyph, Shaping, Style,
+    SwashCache, SwashContent, SwashImage, Weight, Wrap,
 };
 use tiny_skia::Pixmap;
 use unicode_segmentation::UnicodeSegmentation;
@@ -147,8 +147,25 @@ impl TextEngine {
         clip: Clip,
         max_width: f32,
     ) -> f32 {
+        let (glyphs, width) = self.layout_line(x, y_top, spans, monospace, max_width);
+        for (glyph, color) in glyphs {
+            self.draw_glyph(pixmap, glyph, color, clip);
+        }
+        width
+    }
+
+    /// Shape one line and return its glyphs without rasterising them. The GPU
+    /// renderer turns these into atlas quads instead.
+    pub fn layout_line(
+        &mut self,
+        x: f32,
+        y_top: f32,
+        spans: &[Span],
+        monospace: Option<f32>,
+        max_width: f32,
+    ) -> (Vec<(PhysicalGlyph, Rgb)>, f32) {
         if spans.is_empty() {
-            return 0.0;
+            return (Vec::new(), 0.0);
         }
         let metrics = Metrics::new(self.font_size, self.cell_h);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
@@ -228,10 +245,12 @@ impl TextEngine {
             }
         }
 
-        for (glyph, color) in glyphs {
-            self.draw_glyph(pixmap, glyph, color, clip);
-        }
-        width
+        (glyphs, width)
+    }
+
+    /// Rasterised glyph image for a cache key, if the font has one.
+    pub fn glyph_image(&mut self, key: CacheKey) -> Option<&SwashImage> {
+        self.cache.get_image(&mut self.font_system, key).as_ref()
     }
 
     fn draw_glyph(

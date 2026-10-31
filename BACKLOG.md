@@ -41,6 +41,11 @@ matter more than the number.
 
 ## Shipped since 0.0.2
 
+- **GPU renderer (PERF-02)**: rectangles and text now paint directly on the GPU
+  through wgpu, with the tiny-skia/softbuffer software path kept as an automatic
+  fallback. Pick a backend with `[render] backend = "auto" | "gpu" | "cpu"`, or
+  override a single run with `PROMPT_RENDER`. The README demo and
+  `scripts/demo.sh` exercise the GPU path.
 - **Split panes** (post-0.0.7): nested horizontal/vertical splits with
   draggable dividers, independent shells, cwd, composers and command blocks per
   pane, animated open/close, pane zoom, and visible split/zoom/close controls in
@@ -400,7 +405,6 @@ and crash-safe startup diagnostics.
 - **CORE-13 · Tab bar and session restore** — detachable background tabs shipped in 0.0.3; this covers a visible tab strip, reordering, and restoring tabs and windows. Splits are promoted to CORE-16.
 - **CORE-14 · Session restore and crash recovery** — reopen windows, cwd, agent sessions.
 - **PERF-01 · Dirty-row rendering** — only reshape rows that changed; keep the current grid cache.
-- **PERF-02 · Optional GPU renderer** — for 4K/120 Hz and very large grids.
 - **PERF-03 · Startup budget** — <100 ms to first frame, lazy font loading.
 - **PERF-04 · Scrollback compression and caps** — expose libghostty’s compression and memory limits.
 - **REL-01 · Crash reporting** — opt-in, with a local report preview.

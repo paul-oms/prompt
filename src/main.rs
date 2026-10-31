@@ -4,6 +4,7 @@ mod config;
 mod editor;
 mod ffi;
 mod font;
+mod gpu;
 mod highlight;
 mod history;
 mod keys;
