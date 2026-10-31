@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Scripted sequence used to record docs/demo.gif.
+# GPU renderer stress sequence.
 #
 # Run it inside Prompt with the GPU renderer enabled:
 #   PROMPT_RENDER=gpu PROMPT_AUTOTYPE="$PWD/scripts/demo.sh" ./target/release/prompt
 #
-# It stays deliberately short and readable so the demo can be re-recorded when
-# the UI changes.
+# The README feature demo is recorded separately by driving the app through
+# splits, background tabs and block view. This script is the quick render test.
 
 set -u
 
