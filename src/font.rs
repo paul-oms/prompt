@@ -29,6 +29,20 @@ impl Clip {
         Self { x, y, w, h }
     }
 
+    /// Overlap of two clips. A zero-sized result means nothing is visible.
+    pub fn intersect(&self, other: Clip) -> Clip {
+        let x = self.x.max(other.x);
+        let y = self.y.max(other.y);
+        let right = (self.x + self.w).min(other.x + other.w);
+        let bottom = (self.y + self.h).min(other.y + other.h);
+        Clip {
+            x,
+            y,
+            w: (right - x).max(0.0),
+            h: (bottom - y).max(0.0),
+        }
+    }
+
     fn contains(&self, x: i32, y: i32) -> bool {
         x as f32 >= self.x
             && y as f32 >= self.y

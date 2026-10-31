@@ -18,7 +18,7 @@ It's written in Rust and based on [libghostty](https://github.com/ghostty-org/gh
 
 No configuration, no setup. It just works.
 
-![Prompt demo: running commands in the editor-style composer, moving a command to the background panel, and browsing a block](docs/demo.gif)
+![Prompt demo: running commands in two split panes, resizing and zooming them, and parking a running command in the shared background panel](docs/demo.gif)
 
 ## Download
 
@@ -119,7 +119,12 @@ Prompt is designed for both macOS and Linux. `Cmd` means `Cmd` on macOS and
 | Scroll terminal | `Shift+PageUp/Down`, wheel | same |
 | Previous / next command block | `Cmd+Shift+↑/↓` | `Ctrl+Shift+↑/↓` |
 | Open / close block view | `Cmd+Shift+B` | `Ctrl+Shift+B` |
-| Move running command to background | `Cmd+Shift+D` | `Ctrl+Shift+D` |
+| Split pane right | `Cmd+Shift+D` | `Ctrl+Shift+D` |
+| Split pane down | `Cmd+Shift+E` | `Ctrl+Shift+E` |
+| Move focus between panes | `Cmd+Shift+←/→/↑/↓` | `Ctrl+Shift+←/→/↑/↓` |
+| Zoom pane | `Cmd+Shift+Enter` | `Ctrl+Shift+Enter` |
+| Close pane | `Cmd+Shift+W` | `Ctrl+Shift+W` |
+| Move running command to background | `Cmd+Shift+M` | `Ctrl+Shift+M` |
 | Fullscreen | `F11`, `Cmd+Ctrl+F` | `F11` |
 | Zoom font | `Cmd+=` / `Cmd+-` / `Cmd+0` | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
 
@@ -127,6 +132,14 @@ In the terminal grid: click and drag to select, double-click a word,
 triple-click a line, then copy. While a TUI has mouse reporting enabled,
 Prompt forwards clicks, releases and wheel events; hold `Shift` to select
 text instead.
+
+Split panes have a slim header with visible split, zoom and close buttons, so
+the feature is reachable without memorising shortcuts. Drag the divider to
+resize; each pane keeps its own shell, cwd, composer and command blocks. The
+background panel is shared by the whole window, so parked commands stay put
+while you split and focus panes. While splits are open, `Cmd/Ctrl+Shift+↑/↓`
+moves focus instead of jumping between command blocks; close the split (or use
+block view) to browse blocks.
 
 In block view: `[`/`]` moves between blocks, `g`/`G` snaps to the top or
 bottom, `e` expands a long block, `/` searches inside it, `n`/`N` walks the

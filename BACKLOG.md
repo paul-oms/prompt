@@ -1,8 +1,8 @@
 # Prompt — feature backlog
 
-Status: 0.0.7 tagged on 2026-10-30. Command blocks, background tabs, inline
-suggestions, macOS runtime validation and the DMG pipeline are in; split panes
-and on-device command generation are next. This is the working backlog for
+Status: split panes landed after 0.0.7. Command blocks, background tabs,
+inline suggestions, macOS runtime validation and the DMG pipeline are in;
+on-device command generation is next. This is the working backlog for
 turning Prompt from a strong terminal prototype into the terminal for vibe coders
 and agentic development.
 
@@ -41,13 +41,17 @@ matter more than the number.
 
 ## Shipped since 0.0.2
 
+- **Split panes** (post-0.0.7): nested horizontal/vertical splits with
+  draggable dividers, independent shells, cwd, composers and command blocks per
+  pane, animated open/close, pane zoom, and visible split/zoom/close controls in
+  each pane header. The background panel stays shared by the window.
 - **Command blocks** (0.0.3–0.0.4): every command becomes a block with a row
   range and exit status; `Ctrl+Shift+B` opens block view with `[`/`]`, a 300-line
   lazy reader, `/` search, `e` expand and `n`/`N` match navigation.
-- **Detachable background tabs** (0.0.3–0.0.7): `Ctrl+Shift+D` parks the running
-  tab in the right-hand panel with a live output preview, running timer, exit
-  status, scrollable list, click-to-attach/kill, and automatic promotion when the
-  foreground shell exits.
+- **Detachable background tabs** (0.0.3–0.0.7): `Ctrl+Shift+M` (formerly
+  `Ctrl+Shift+D`) parks the running tab in the right-hand panel with a live
+  output preview, running timer, exit status, scrollable list,
+  click-to-attach/kill, and automatic promotion when the foreground shell exits.
 - **Inline suggestions and completion** (0.0.2–0.0.5): dim ghost history and
   command suggestions, `Right`/`Tab` to accept, case-insensitive PATH/cwd/history
   completion, path quoting, and a popup for ambiguous Tab matches.
@@ -64,20 +68,22 @@ matter more than the number.
 ## P0 — Now
 
 ### CORE-16 · Split panes
-**Value 5 · Effort L · Confidence M**
-*Promoted from CORE-13.*
+**Value 5 · Effort L · Confidence M · Shipped post-0.0.7**
 
 Developers run an agent in one pane and a shell in another. Without visible
 splits Prompt is still a single-session terminal, which is the main reason to
 keep another terminal open.
 
-- Horizontal and vertical splits, draggable dividers, per-pane cwd and shell.
-- Focus movement, close-pane and zoom-pane shortcuts; keep the background panel
-  as the “parked work” surface rather than overloading it with splits.
-- Reuse the session/PTY, block, completion and history model per pane instead of
-  special-casing one of them.
-- Decide split keybindings first: `Ctrl+Shift+D` already moves a running tab to
-  the background panel.
+- Horizontal and vertical splits nest, with draggable dividers and independent
+  cwd, shell, composer, blocks, selection and history cursor per pane.
+- Focus movement, close-pane and zoom-pane shortcuts; each pane also exposes
+  visible split, zoom and close controls. The background panel remains the
+  window-wide “parked work” surface rather than becoming per-pane.
+- Split creation reuses the session/PTY, block, completion and history model per
+  pane instead of special-casing one of them.
+- `Ctrl+Shift+D` now splits right; detaching a running command moved to
+  `Ctrl+Shift+M`. `Ctrl+Shift+E` splits down, `Ctrl+Shift+W` closes a pane,
+  `Ctrl+Shift+Enter` zooms and `Ctrl+Shift+Arrow` moves focus.
 - Drag-to-split and session restore stay in CORE-13.
 
 **Done when:** two shells run side by side with independent composers, blocks,
@@ -458,7 +464,7 @@ help without joining a Discord.
 
 | Rank | ID | Feature | Progress | Value | Effort | Confidence | Why now |
 |---:|---|---|---|---:|---|---|---|
-| 1 | CORE-16 | Split panes | Promoted from P2 | 5 | L | M | Agents need a visible shell beside them |
+| 1 | CORE-16 | Split panes | Shipped | 5 | L | M | Agents need a visible shell beside them |
 | 2 | SHELL-05 | Integration diagnostics | Not started | 5 | S | H | Zero-config trust |
 | 3 | AGENT-03 | NL → command preview | Not started | 5 | L | M | Signature feature |
 | 4 | AGENT-13 | Apple Foundation Models | New | 5 | M | M | Private, zero-setup AI on macOS 26+ |
@@ -515,5 +521,6 @@ paths by default.
 5. **Scope of “agent awareness”:** process detection + status first; no prompt
    interception or token streaming until the block model is stable.
 6. **Minimum macOS:** decide deployment target (e.g. macOS 12+) before signing.
-7. **Split model:** decide nested splits inside a tab vs top-level panes, and
-   resolve the `Ctrl+Shift+D` detach conflict before CORE-16 lands.
+7. **Split model:** nested splits inside a window, with the background panel
+   shared by the whole window. Resolved with CORE-16: `Ctrl+Shift+D` splits
+   right, `Ctrl+Shift+E` splits down, and detaching moved to `Ctrl+Shift+M`.

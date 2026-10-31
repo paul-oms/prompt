@@ -39,6 +39,199 @@ enum Focus {
     Grid,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Rect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+impl Rect {
+    fn new(x: f32, y: f32, w: f32, h: f32) -> Self {
+        Self { x, y, w, h }
+    }
+
+    fn right(&self) -> f32 {
+        self.x + self.w
+    }
+
+    fn bottom(&self) -> f32 {
+        self.y + self.h
+    }
+
+    fn center(&self) -> (f32, f32) {
+        (self.x + self.w / 2.0, self.y + self.h / 2.0)
+    }
+
+    fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.x && y >= self.y && x < self.right() && y < self.bottom()
+    }
+
+    fn clip(&self) -> Clip {
+        Clip::new(self.x, self.y, self.w, self.h)
+    }
+}
+
+/// A binary split tree. Leaves hold stable pane ids so closing a pane never
+/// renumbers the others.
+#[derive(Clone)]
+enum PaneNode {
+    Leaf(u64),
+    Split {
+        axis: SplitAxis,
+        ratio: f32,
+        first: Box<PaneNode>,
+        second: Box<PaneNode>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitAxis {
+    /// Panes side by side, with a vertical divider.
+    Vertical,
+    /// Panes stacked, with a horizontal divider.
+    Horizontal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaneAction {
+    SplitVertical,
+    SplitHorizontal,
+    Zoom,
+    Close,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PaneControl {
+    rect: Rect,
+    action: PaneAction,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PaneLayout {
+    rect: Rect,
+    header: Rect,
+    grid: GridLayout,
+    card: CardLayout,
+    controls: Vec<PaneControl>,
+}
+
+/// Everything a split pane owns. The active pane lives in the matching fields
+/// on `PromptApp`; inactive panes park their state here and are swapped back in
+/// when they gain focus.
+struct PaneState {
+    session: Option<TerminalSession>,
+    pty: Option<Pty>,
+    blocks: Vec<Block>,
+    mode: Mode,
+    focus: Focus,
+    cwd: PathBuf,
+    cwd_label: String,
+    running_cmd: String,
+    running_started: Instant,
+    last_status: Option<(i32, Instant)>,
+    title: String,
+    editor: Editor,
+    hscroll: usize,
+    composer_scroll: usize,
+    layout_composer_lines: usize,
+    history_index: Option<usize>,
+    history_draft: String,
+    search: Option<SearchState>,
+    completion_popup: Option<CompletionState>,
+    sel_anchor: Option<(u16, u16)>,
+    sel_drag: bool,
+    block_view: Option<BlockView>,
+    pending_highlight: Option<(u64, u16, u16)>,
+    got_prompt: bool,
+    exited: bool,
+    integration_deadline: Instant,
+}
+
+impl PaneState {
+    fn new(cwd: PathBuf, integrated: bool) -> Self {
+        let now = Instant::now();
+        Self {
+            session: None,
+            pty: None,
+            blocks: Vec::new(),
+            mode: if integrated {
+                Mode::Compose
+            } else {
+                Mode::Direct
+            },
+            focus: Focus::Composer,
+            cwd,
+            cwd_label: String::new(),
+            running_cmd: String::new(),
+            running_started: now,
+            last_status: None,
+            title: String::new(),
+            editor: Editor::default(),
+            hscroll: 0,
+            composer_scroll: 0,
+            layout_composer_lines: 1,
+            history_index: None,
+            history_draft: String::new(),
+            search: None,
+            completion_popup: None,
+            sel_anchor: None,
+            sel_drag: false,
+            block_view: None,
+            pending_highlight: None,
+            got_prompt: false,
+            exited: false,
+            integration_deadline: now + Duration::from_secs(4),
+        }
+    }
+}
+
+struct PaneSlot {
+    id: u64,
+    /// Empty for the focused pane, whose state lives on `PromptApp`.
+    state: Option<PaneState>,
+    layout: PaneLayout,
+    /// Target rectangle in window pixels.
+    target: Rect,
+    /// Current animated rectangle.
+    anim: Rect,
+    laid_out: bool,
+}
+
+impl PaneSlot {
+    fn new(id: u64) -> Self {
+        Self {
+            id,
+            state: None,
+            layout: PaneLayout::default(),
+            target: Rect::default(),
+            anim: Rect::default(),
+            laid_out: false,
+        }
+    }
+}
+
+/// A pane that is animating out after being closed. Its shell is still alive
+/// for the duration of the animation.
+struct ClosingPane {
+    state: PaneState,
+    layout: PaneLayout,
+    anim: Rect,
+    target: Rect,
+    started: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct DividerHit {
+    rect: Rect,
+    axis: SplitAxis,
+    /// Path through the split tree: false = first child, true = second.
+    path: Vec<bool>,
+    /// Region the parent split divides, used to recompute the ratio on drag.
+    area: Rect,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct GridLayout {
     x: f32,
@@ -188,6 +381,21 @@ pub struct PromptApp {
     pty: Option<Pty>,
     /// Commands run in the foreground tab, for block chrome.
     blocks: Vec<Block>,
+    /// Split panes, including the focused one. The focused pane keeps its live
+    /// state in the fields above and its `PaneSlot::state` is empty.
+    panes: Vec<PaneSlot>,
+    pane_tree: PaneNode,
+    active_pane: u64,
+    next_pane_id: u64,
+    /// Current target of each draggable divider.
+    dividers: Vec<DividerHit>,
+    drag_divider: Option<DividerHit>,
+    zoomed_pane: Option<u64>,
+    closing_panes: Vec<ClosingPane>,
+    /// Split and zoom controls shown when there is only one pane.
+    single_controls: Vec<PaneControl>,
+    hover_control: Option<(u64, PaneAction)>,
+    anim_last: Instant,
     /// Tabs detached to the background panel. Their shells keep running.
     background: Vec<BackgroundTab>,
     panel: PanelLayout,
@@ -322,6 +530,17 @@ impl PromptApp {
             session: None,
             pty: None,
             blocks: Vec::new(),
+            panes: vec![PaneSlot::new(0)],
+            pane_tree: PaneNode::Leaf(0),
+            active_pane: 0,
+            next_pane_id: 1,
+            dividers: Vec::new(),
+            drag_divider: None,
+            zoomed_pane: None,
+            closing_panes: Vec::new(),
+            single_controls: Vec::new(),
+            hover_control: None,
+            anim_last: started,
             background: Vec::new(),
             panel: PanelLayout::default(),
             panel_scroll: 0.0,
@@ -569,6 +788,7 @@ impl PromptApp {
         self.last_status = None;
         self.got_prompt = false;
         self.exited = false;
+        self.title.clear();
         self.sel_anchor = None;
         self.sel_drag = false;
         self.editor.clear();
@@ -578,6 +798,7 @@ impl PromptApp {
         self.composer_scroll = 0;
         self.integration_deadline = Instant::now() + Duration::from_secs(4);
         self.grid_dirty = true;
+        self.update_window_title();
         self.request_redraw();
         Ok(())
     }
@@ -616,6 +837,16 @@ impl PromptApp {
                     self.text.cell_h.max(1.0) as u32,
                 );
             }
+            for slot in &mut self.panes {
+                if let Some(state) = &mut slot.state {
+                    if let Some(session) = &mut state.session {
+                        session.set_cell_size(
+                            self.text.cell_w.max(1.0) as u32,
+                            self.text.cell_h.max(1.0) as u32,
+                        );
+                    }
+                }
+            }
         }
 
         let margin = self.s(14.0);
@@ -650,70 +881,759 @@ impl PromptApp {
         };
         self.clamp_panel_scroll();
 
-        let grid_x = margin + padding;
-        let grid_y = margin + padding;
-        let grid_w = (w - 2.0 * grid_x - reserved).max(1.0);
-        let grid_h = (h - margin - base_card - gap - grid_y).max(1.0);
-        let cols = ((grid_w / self.text.cell_w).floor() as u16).max(20);
-        let rows = ((grid_h / self.text.cell_h).floor() as u16).max(5);
+        let split_mode = self.panes.len() > 1;
+        if split_mode {
+            let content = Rect::new(
+                margin,
+                margin,
+                (w - margin * 2.0 - reserved).max(1.0),
+                (h - margin * 2.0).max(1.0),
+            );
+            let card_heights = self.pane_card_heights();
+            let mut layouts: Vec<(u64, PaneLayout)> = Vec::new();
+            let mut dividers = Vec::new();
+            let cell_w = self.text.cell_w.max(1.0);
+            let cell_h = self.text.cell_h.max(1.0);
+            if let Some(zoom) = self.zoomed_pane {
+                if self.panes.iter().any(|slot| slot.id == zoom) {
+                    layout_pane_leaf(
+                        zoom,
+                        content,
+                        &card_heights,
+                        cell_w,
+                        cell_h,
+                        scale,
+                        &mut layouts,
+                    );
+                }
+            }
+            if layouts.is_empty() {
+                let tree = &self.pane_tree;
+                let mut path = Vec::new();
+                layout_pane_node(
+                    tree,
+                    content,
+                    &card_heights,
+                    cell_w,
+                    cell_h,
+                    scale,
+                    &mut layouts,
+                    &mut dividers,
+                    &mut path,
+                );
+            }
+            self.dividers = dividers;
+            for (id, layout) in layouts {
+                if let Some(slot) = self.panes.iter_mut().find(|slot| slot.id == id) {
+                    slot.layout = layout;
+                    slot.target = slot.layout.rect;
+                    if !slot.laid_out {
+                        slot.anim = slot.target;
+                        slot.laid_out = true;
+                    }
+                }
+            }
+            let control_layouts: Vec<(u64, PaneLayout)> = self
+                .panes
+                .iter()
+                .map(|slot| (slot.id, slot.layout.clone()))
+                .collect();
+            for (id, layout) in control_layouts {
+                let controls = self.pane_controls(id, &layout);
+                if let Some(slot) = self.panes.iter_mut().find(|slot| slot.id == id) {
+                    slot.layout.controls = controls;
+                }
+            }
+            self.refresh_pane_card_text();
+            if let Some(slot) = self.panes.iter().find(|slot| slot.id == self.active_pane) {
+                self.grid = slot.layout.grid;
+                self.card = slot.layout.card;
+            }
+            self.single_controls.clear();
+        } else {
+            let grid_x = margin + padding;
+            let grid_y = margin + padding;
+            let grid_w = (w - 2.0 * grid_x - reserved).max(1.0);
+            let grid_h = (h - margin - base_card - gap - grid_y).max(1.0);
+            let cols = ((grid_w / self.text.cell_w).floor() as u16).max(20);
+            let rows = ((grid_h / self.text.cell_h).floor() as u16).max(5);
 
-        self.grid = GridLayout {
-            x: grid_x,
-            y: grid_y,
-            w: cols as f32 * self.text.cell_w,
-            h: rows as f32 * self.text.cell_h,
-            cols,
-            rows,
-        };
-        self.card = CardLayout {
-            x: margin,
-            w: (w - margin * 2.0 - reserved).max(1.0),
-            h: base_card,
-            y: h - margin - base_card,
-            ..CardLayout::default()
-        };
-
-        let changed = self
-            .session
-            .as_ref()
-            .map(|s| s.cols != cols || s.rows != rows)
-            .unwrap_or(false);
-        if changed {
-            self.grid_dirty = true;
-            if let Some(session) = &mut self.session {
-                session.resize(
-                    cols,
-                    rows,
-                    self.text.cell_w.max(1.0) as u32,
-                    self.text.cell_h.max(1.0) as u32,
-                );
+            self.grid = GridLayout {
+                x: grid_x,
+                y: grid_y,
+                w: cols as f32 * self.text.cell_w,
+                h: rows as f32 * self.text.cell_h,
+                cols,
+                rows,
+            };
+            self.card = CardLayout {
+                x: margin,
+                w: (w - margin * 2.0 - reserved).max(1.0),
+                h: base_card,
+                y: h - margin - base_card,
+                ..CardLayout::default()
+            };
+            self.fill_card_text_metrics();
+            if let Some(slot) = self
+                .panes
+                .iter_mut()
+                .find(|slot| slot.id == self.active_pane)
+            {
+                slot.layout = PaneLayout {
+                    rect: Rect::new(0.0, 0.0, w, h),
+                    header: Rect::default(),
+                    grid: self.grid,
+                    card: self.card,
+                    controls: Vec::new(),
+                };
+                slot.target = slot.layout.rect;
+                if !slot.laid_out {
+                    slot.anim = slot.target;
+                    slot.laid_out = true;
+                }
             }
-            if let Some(pty) = &self.pty {
-                pty.resize(
-                    cols,
-                    rows,
-                    self.text.cell_w.max(1.0) as u32,
-                    self.text.cell_h.max(1.0) as u32,
-                );
-            }
-            // Detached commands should still see the current terminal size.
-            for tab in &mut self.background {
-                tab.session.resize(
-                    cols,
-                    rows,
-                    self.text.cell_w.max(1.0) as u32,
-                    self.text.cell_h.max(1.0) as u32,
-                );
-                tab.pty.resize(
-                    cols,
-                    rows,
-                    self.text.cell_w.max(1.0) as u32,
-                    self.text.cell_h.max(1.0) as u32,
-                );
-            }
+            self.single_controls = self.single_pane_controls();
+            self.dividers.clear();
         }
+
+        self.resize_pane_sessions();
         self.grid_dirty = true;
         self.request_redraw();
+    }
+
+    /// Composer heights for every pane for the current layout pass.
+    fn pane_card_heights(&self) -> Vec<(u64, f32)> {
+        let s = |v: f32| (v * self.scale).round();
+        let hint_h = if self.config.ui.show_hints {
+            s(18.0)
+        } else {
+            0.0
+        };
+        self.panes
+            .iter()
+            .map(|slot| {
+                let active = slot.id == self.active_pane;
+                let (mode, lines, block_view) = if active {
+                    (
+                        self.mode,
+                        self.editor.line_count(),
+                        self.block_view.is_some(),
+                    )
+                } else if let Some(state) = &slot.state {
+                    (
+                        state.mode,
+                        state.editor.line_count(),
+                        state.block_view.is_some(),
+                    )
+                } else {
+                    (Mode::Compose, 1, false)
+                };
+                let lines = if block_view {
+                    1
+                } else if mode == Mode::Compose {
+                    lines.clamp(1, 5)
+                } else {
+                    1
+                };
+                let hint = if active { hint_h } else { 0.0 };
+                let height = s(10.0) * 2.0 + lines as f32 * self.text.cell_h + s(4.0) + hint;
+                (slot.id, height)
+            })
+            .collect()
+    }
+
+    fn resize_pane_sessions(&mut self) {
+        let cell_w = self.text.cell_w.max(1.0) as u32;
+        let cell_h = self.text.cell_h.max(1.0) as u32;
+        let (cols, rows) = (self.grid.cols, self.grid.rows);
+        let active_changed = self
+            .session
+            .as_ref()
+            .map(|session| session.cols != cols || session.rows != rows)
+            .unwrap_or(false);
+        if active_changed {
+            if let Some(session) = &mut self.session {
+                session.resize(cols, rows, cell_w, cell_h);
+            }
+            if let Some(pty) = &mut self.pty {
+                pty.resize(cols, rows, cell_w, cell_h);
+            }
+        }
+        let active = self.active_pane;
+        for slot in &mut self.panes {
+            if slot.id == active {
+                continue;
+            }
+            let pane_cols = slot.layout.grid.cols;
+            let pane_rows = slot.layout.grid.rows;
+            if pane_cols == 0 || pane_rows == 0 {
+                continue;
+            }
+            let Some(state) = &mut slot.state else {
+                continue;
+            };
+            let changed = state
+                .session
+                .as_ref()
+                .map(|session| session.cols != pane_cols || session.rows != pane_rows)
+                .unwrap_or(false);
+            if !changed {
+                continue;
+            }
+            if let Some(session) = &mut state.session {
+                session.resize(pane_cols, pane_rows, cell_w, cell_h);
+            }
+            if let Some(pty) = &mut state.pty {
+                pty.resize(pane_cols, pane_rows, cell_w, cell_h);
+            }
+        }
+        // Detached commands should still see a sensible terminal size.
+        for tab in &mut self.background {
+            tab.session.resize(cols, rows, cell_w, cell_h);
+            tab.pty.resize(cols, rows, cell_w, cell_h);
+        }
+    }
+
+    fn fill_card_text_metrics(&mut self) {
+        let pad = self.s(12.0);
+        let cell_w = self.text.cell_w;
+        let cwd = self.cwd_display();
+        let cwd_w = self.text.measure_text(&cwd, false);
+        let chip_w = (cwd_w + 18.0 * self.scale)
+            .min(280.0 * self.scale)
+            .min(self.card.w * 0.45)
+            .max(10.0);
+        let text_x = self.card.x + pad + chip_w + self.s(14.0) + cell_w + self.s(10.0);
+        self.card.text_x = text_x
+            .min(self.card.x + self.card.w - self.s(16.0))
+            .max(self.card.x + pad);
+        self.card.text_y = self.card.y + pad;
+    }
+
+    /// Recompute each split pane's composer text origin with its own cwd chip.
+    /// This keeps click-to-edit exact before the first frame after a focus swap.
+    fn refresh_pane_card_text(&mut self) {
+        let cwds: Vec<(u64, PathBuf)> = self
+            .panes
+            .iter()
+            .map(|slot| {
+                let cwd = if slot.id == self.active_pane {
+                    self.cwd.clone()
+                } else if let Some(state) = &slot.state {
+                    state.cwd.clone()
+                } else {
+                    self.cwd.clone()
+                };
+                (slot.id, cwd)
+            })
+            .collect();
+        let pad = self.s(12.0);
+        let cell_w = self.text.cell_w;
+        let max_chip = 280.0 * self.scale;
+        let gap = self.s(14.0) + cell_w + self.s(10.0);
+        let edge = self.s(16.0);
+        let chip_pad = 18.0 * self.scale;
+        for (id, cwd) in cwds {
+            let label = display_path(&cwd);
+            let cwd_w = self.text.measure_text(&label, false);
+            if let Some(slot) = self.panes.iter_mut().find(|slot| slot.id == id) {
+                let card = slot.layout.card;
+                let chip_w = (cwd_w + chip_pad)
+                    .min(max_chip)
+                    .min(card.w * 0.45)
+                    .max(10.0);
+                let text_x = card.x + pad + chip_w + gap;
+                slot.layout.card.text_x = text_x.min(card.x + card.w - edge).max(card.x + pad);
+                slot.layout.card.text_y = card.y + pad;
+            }
+        }
+    }
+
+    /// Compact split controls shown when there is a single pane.
+    fn single_pane_controls(&mut self) -> Vec<PaneControl> {
+        let s = |v: f32| (v * self.scale).round();
+        let labels = [
+            ("split →", PaneAction::SplitVertical),
+            ("split ↓", PaneAction::SplitHorizontal),
+        ];
+        let pad_x = s(9.0);
+        let pad_y = s(3.0);
+        let gap = s(6.0);
+        let h = self.text.cell_h + pad_y * 2.0;
+        let mut widths = Vec::new();
+        for (label, _) in labels {
+            widths.push(self.text.measure_text(label, false) + pad_x * 2.0);
+        }
+        let total: f32 = widths.iter().sum::<f32>() + gap * (labels.len() as f32 - 1.0);
+        let mut x = self.grid.x + self.grid.w - total - s(8.0);
+        let y = self.grid.y + s(8.0);
+        let mut controls = Vec::new();
+        for ((label, action), width) in labels.into_iter().zip(widths) {
+            let _ = label;
+            controls.push(PaneControl {
+                rect: Rect::new(x, y, width, h),
+                action,
+            });
+            x += width + gap;
+        }
+        controls
+    }
+
+    fn pane_controls(&mut self, id: u64, layout: &PaneLayout) -> Vec<PaneControl> {
+        if layout.header.w <= 0.0 {
+            return Vec::new();
+        }
+        let s = |v: f32| (v * self.scale).round();
+        let pad_x = s(8.0);
+        let gap = s(5.0);
+        let h = (layout.header.h - s(8.0)).max(s(12.0));
+        let y = layout.header.y + (layout.header.h - h) / 2.0;
+        let wide = layout.header.w > s(360.0);
+        let zoom = if self.zoomed_pane == Some(id) {
+            if wide {
+                "unzoom"
+            } else {
+                "⤢"
+            }
+        } else if wide {
+            "zoom"
+        } else {
+            "⤢"
+        };
+        let mut actions = vec![
+            if wide { "split →" } else { "⇄" },
+            if wide { "split ↓" } else { "⇅" },
+            zoom,
+        ];
+        if self.panes.len() > 1 {
+            actions.push("×");
+        }
+        let kinds = [
+            PaneAction::SplitVertical,
+            PaneAction::SplitHorizontal,
+            PaneAction::Zoom,
+            PaneAction::Close,
+        ];
+        let widths: Vec<f32> = actions
+            .iter()
+            .map(|label| self.text.measure_text(label, false) + pad_x * 2.0)
+            .collect();
+        let total: f32 = widths.iter().sum::<f32>() + gap * (actions.len() as f32 - 1.0);
+        let mut x = layout.header.x + layout.header.w - s(6.0) - total;
+        let min_x = layout.header.x + s(6.0);
+        let mut controls = Vec::new();
+        for ((label, width), action) in actions.into_iter().zip(widths).zip(kinds) {
+            if x < min_x && !matches!(action, PaneAction::Close) {
+                continue;
+            }
+            let _ = label;
+            controls.push(PaneControl {
+                rect: Rect::new(x.max(min_x), y, width, h),
+                action,
+            });
+            x += width + gap;
+        }
+        controls
+    }
+
+    // ---- split panes ------------------------------------------------------
+
+    fn pane_index(&self, id: u64) -> Option<usize> {
+        self.panes.iter().position(|slot| slot.id == id)
+    }
+
+    fn active_layout(&self) -> PaneLayout {
+        self.panes
+            .iter()
+            .find(|slot| slot.id == self.active_pane)
+            .map(|slot| slot.layout.clone())
+            .unwrap_or_default()
+    }
+
+    fn take_active_state(&mut self) -> PaneState {
+        PaneState {
+            session: self.session.take(),
+            pty: self.pty.take(),
+            blocks: std::mem::take(&mut self.blocks),
+            mode: self.mode,
+            focus: self.focus,
+            cwd: std::mem::take(&mut self.cwd),
+            cwd_label: std::mem::take(&mut self.cwd_label),
+            running_cmd: std::mem::take(&mut self.running_cmd),
+            running_started: self.running_started,
+            last_status: self.last_status.take(),
+            title: std::mem::take(&mut self.title),
+            editor: std::mem::take(&mut self.editor),
+            hscroll: self.hscroll,
+            composer_scroll: self.composer_scroll,
+            layout_composer_lines: self.layout_composer_lines,
+            history_index: self.history_index.take(),
+            history_draft: std::mem::take(&mut self.history_draft),
+            search: self.search.take(),
+            completion_popup: self.completion_popup.take(),
+            sel_anchor: self.sel_anchor.take(),
+            sel_drag: self.sel_drag,
+            block_view: self.block_view.take(),
+            pending_highlight: self.pending_highlight.take(),
+            got_prompt: self.got_prompt,
+            exited: self.exited,
+            integration_deadline: self.integration_deadline,
+        }
+    }
+
+    fn apply_state(&mut self, state: PaneState) {
+        self.session = state.session;
+        self.pty = state.pty;
+        self.blocks = state.blocks;
+        self.mode = state.mode;
+        self.focus = state.focus;
+        self.cwd = state.cwd;
+        self.cwd_label = state.cwd_label;
+        self.running_cmd = state.running_cmd;
+        self.running_started = state.running_started;
+        self.last_status = state.last_status;
+        self.title = state.title;
+        self.editor = state.editor;
+        self.hscroll = state.hscroll;
+        self.composer_scroll = state.composer_scroll;
+        self.layout_composer_lines = state.layout_composer_lines;
+        self.history_index = state.history_index;
+        self.history_draft = state.history_draft;
+        self.search = state.search;
+        self.completion_popup = state.completion_popup;
+        self.sel_anchor = state.sel_anchor;
+        self.sel_drag = state.sel_drag;
+        self.block_view = state.block_view;
+        self.pending_highlight = state.pending_highlight;
+        self.got_prompt = state.got_prompt;
+        self.exited = state.exited;
+        self.integration_deadline = state.integration_deadline;
+        self.ime_composing = false;
+        self.ime_preedit.clear();
+        self.drag_divider = None;
+        self.grid_dirty = true;
+    }
+
+    fn store_active(&mut self) {
+        let id = self.active_pane;
+        let state = self.take_active_state();
+        if let Some(slot) = self.panes.iter_mut().find(|slot| slot.id == id) {
+            slot.state = Some(state);
+        }
+    }
+
+    fn focus_pane(&mut self, id: u64) {
+        if id == self.active_pane || self.pane_index(id).is_none() {
+            return;
+        }
+        let fallback_cwd = self.cwd.clone();
+        self.store_active();
+        self.active_pane = id;
+        if self.zoomed_pane.is_some_and(|zoom| zoom != id) {
+            self.zoomed_pane = None;
+        }
+        let fallback = PaneState::new(fallback_cwd, self.launch.integrated);
+        let state = self
+            .panes
+            .iter_mut()
+            .find(|slot| slot.id == id)
+            .and_then(|slot| slot.state.take())
+            .unwrap_or(fallback);
+        self.apply_state(state);
+        self.relayout();
+        self.update_window_title();
+        self.request_redraw();
+    }
+
+    fn update_window_title(&mut self) {
+        if let Some(window) = &self.window {
+            if self.title.trim().is_empty() {
+                window.set_title("Prompt");
+            } else {
+                window.set_title(&format!("{} — Prompt", self.title));
+            }
+        }
+    }
+
+    fn split_active(&mut self, axis: SplitAxis) {
+        self.split_pane(self.active_pane, axis);
+    }
+
+    fn split_pane(&mut self, id: u64, axis: SplitAxis) {
+        if self.pane_index(id).is_none() {
+            return;
+        }
+        if id != self.active_pane {
+            self.focus_pane(id);
+        }
+        self.zoomed_pane = None;
+        let cwd = self.cwd.clone();
+        let new_id = self.next_pane_id;
+        self.next_pane_id += 1;
+        let tree = std::mem::replace(&mut self.pane_tree, PaneNode::Leaf(0));
+        self.pane_tree = split_leaf(tree, id, new_id, axis);
+        self.panes.push(PaneSlot::new(new_id));
+
+        self.store_active();
+        self.active_pane = new_id;
+        self.apply_state(PaneState::new(cwd.clone(), self.launch.integrated));
+        self.relayout();
+
+        // New panes wipe in from the divider instead of popping into place.
+        if let Some(slot) = self.panes.iter_mut().find(|slot| slot.id == new_id) {
+            let target = slot.target;
+            slot.anim = match axis {
+                SplitAxis::Vertical => Rect::new(target.x, target.y, 1.0, target.h),
+                SplitAxis::Horizontal => Rect::new(target.x, target.y, target.w, 1.0),
+            };
+            slot.laid_out = true;
+        }
+
+        if let Err(err) = self.spawn_foreground(cwd) {
+            self.toast(format!("Could not open a split shell: {err:#}"));
+            self.close_pane(new_id);
+            return;
+        }
+        self.welcome = false;
+        self.dock_progress = 1.0;
+        self.dock_started = None;
+        self.grid_dirty = true;
+        self.request_redraw();
+    }
+
+    fn close_active_pane(&mut self) {
+        self.close_pane(self.active_pane);
+    }
+
+    fn close_pane(&mut self, id: u64) {
+        let Some(index) = self.pane_index(id) else {
+            return;
+        };
+        if self.panes.len() <= 1 {
+            self.toast("The last pane stays open");
+            return;
+        }
+        let was_active = id == self.active_pane;
+        if was_active {
+            self.store_active();
+        }
+        let slot = &mut self.panes[index];
+        let state = slot.state.take();
+        let layout = slot.layout.clone();
+        let anim = slot.anim;
+        self.panes.remove(index);
+        if let Some(state) = state {
+            self.closing_panes.push(ClosingPane {
+                state,
+                layout,
+                anim,
+                target: Rect::new(
+                    anim.x + anim.w * 0.5 - 1.0,
+                    anim.y + anim.h * 0.5 - 1.0,
+                    2.0,
+                    2.0,
+                ),
+                started: Instant::now(),
+            });
+        }
+        let tree = std::mem::replace(&mut self.pane_tree, PaneNode::Leaf(0));
+        self.pane_tree = remove_leaf(tree, id).unwrap_or(PaneNode::Leaf(0));
+        if self.zoomed_pane == Some(id) {
+            self.zoomed_pane = None;
+        }
+        if was_active {
+            let next_index = index.min(self.panes.len().saturating_sub(1));
+            let next_id = self.panes[next_index].id;
+            self.active_pane = next_id;
+            let fallback = PaneState::new(shell::home_dir(), self.launch.integrated);
+            let state = self.panes[next_index].state.take().unwrap_or(fallback);
+            self.apply_state(state);
+            self.update_window_title();
+        }
+        self.relayout();
+        self.grid_dirty = true;
+        self.request_redraw();
+    }
+
+    fn toggle_zoom(&mut self) {
+        if self.zoomed_pane == Some(self.active_pane) {
+            self.zoomed_pane = None;
+            self.toast("Split zoom off");
+        } else {
+            self.zoomed_pane = Some(self.active_pane);
+            self.toast("Pane zoomed — press again to restore");
+        }
+        self.relayout();
+        self.grid_dirty = true;
+        self.request_redraw();
+    }
+
+    fn focus_direction(&mut self, dx: f32, dy: f32) {
+        if self.panes.len() <= 1 {
+            return;
+        }
+        let current = self
+            .panes
+            .iter()
+            .find(|slot| slot.id == self.active_pane)
+            .map(|slot| slot.layout.rect)
+            .unwrap_or_default();
+        let (cx, cy) = current.center();
+        let mut best: Option<(f32, u64)> = None;
+        for slot in &self.panes {
+            if slot.id == self.active_pane {
+                continue;
+            }
+            let rect = slot.layout.rect;
+            let (px, py) = rect.center();
+            let along = (px - cx) * dx + (py - cy) * dy;
+            if along <= 1.0 {
+                continue;
+            }
+            let across = ((px - cx) * dy - (py - cy) * dx).abs();
+            let score = along + across * 2.0;
+            if best.map(|(best, _)| score < best).unwrap_or(true) {
+                best = Some((score, slot.id));
+            }
+        }
+        if let Some((_, id)) = best {
+            self.zoomed_pane = None;
+            self.focus_pane(id);
+        }
+    }
+
+    fn advance_pane_animations(&mut self, now: Instant) {
+        let dt = now
+            .duration_since(self.anim_last)
+            .as_secs_f32()
+            .clamp(0.001, 0.05);
+        self.anim_last = now;
+        // Rapid ease-out: most of the movement lands in the first 100 ms.
+        let k = 1.0 - (-dt / 0.035).exp();
+        let mut moved = false;
+        for slot in &mut self.panes {
+            if !slot.laid_out {
+                continue;
+            }
+            let next = lerp_rect(slot.anim, slot.target, k);
+            if (next.x - slot.anim.x).abs() > 0.1
+                || (next.y - slot.anim.y).abs() > 0.1
+                || (next.w - slot.anim.w).abs() > 0.1
+                || (next.h - slot.anim.h).abs() > 0.1
+            {
+                moved = true;
+            }
+            slot.anim = next;
+        }
+        for pane in &mut self.closing_panes {
+            let next = lerp_rect(pane.anim, pane.target, k);
+            if (next.w - pane.anim.w).abs() > 0.1 || (next.h - pane.anim.h).abs() > 0.1 {
+                moved = true;
+            }
+            pane.anim = next;
+        }
+        let had_closing = !self.closing_panes.is_empty();
+        self.closing_panes
+            .retain(|pane| pane.started.elapsed() < Duration::from_millis(190));
+        if moved || had_closing {
+            // The pane frames and grids live in the offscreen cache, so it has
+            // to be repainted for every animation step.
+            self.grid_dirty = true;
+        }
+    }
+
+    fn animations_running(&self) -> bool {
+        if !self.closing_panes.is_empty() {
+            return true;
+        }
+        self.panes.iter().any(|slot| {
+            let a = slot.anim;
+            let b = slot.target;
+            (a.x - b.x).abs() > 0.4
+                || (a.y - b.y).abs() > 0.4
+                || (a.w - b.w).abs() > 0.4
+                || (a.h - b.h).abs() > 0.4
+        })
+    }
+
+    fn pane_at_point(&self, x: f32, y: f32) -> Option<u64> {
+        for slot in &self.panes {
+            if self.zoomed_pane.is_some_and(|zoom| zoom != slot.id) {
+                continue;
+            }
+            if slot.layout.rect.contains(x, y) {
+                return Some(slot.id);
+            }
+        }
+        None
+    }
+
+    fn divider_at(&self, x: f32, y: f32) -> Option<DividerHit> {
+        if self.panes.len() <= 1 || self.zoomed_pane.is_some() {
+            return None;
+        }
+        self.dividers
+            .iter()
+            .find(|divider| divider.rect.contains(x, y))
+            .cloned()
+    }
+
+    fn control_at(&self, x: f32, y: f32) -> Option<(u64, PaneAction)> {
+        if self.panes.len() <= 1 {
+            return self
+                .single_controls
+                .iter()
+                .find(|control| control.rect.contains(x, y))
+                .map(|control| (self.active_pane, control.action));
+        }
+        for slot in &self.panes {
+            if let Some(control) = slot
+                .layout
+                .controls
+                .iter()
+                .find(|control| control.rect.contains(x, y))
+            {
+                return Some((slot.id, control.action));
+            }
+        }
+        None
+    }
+
+    fn run_pane_action(&mut self, id: u64, action: PaneAction) {
+        match action {
+            PaneAction::SplitVertical => self.split_pane(id, SplitAxis::Vertical),
+            PaneAction::SplitHorizontal => self.split_pane(id, SplitAxis::Horizontal),
+            PaneAction::Zoom => {
+                if id != self.active_pane {
+                    self.focus_pane(id);
+                }
+                self.toggle_zoom();
+            }
+            PaneAction::Close => self.close_pane(id),
+        }
+    }
+
+    fn update_divider_drag(&mut self, x: f32, y: f32) {
+        let Some(hit) = self.drag_divider.clone() else {
+            return;
+        };
+        if hit.area.w <= 1.0 || hit.area.h <= 1.0 {
+            return;
+        }
+        let ratio = match hit.axis {
+            SplitAxis::Vertical => (x - hit.area.x) / hit.area.w,
+            SplitAxis::Horizontal => (y - hit.area.y) / hit.area.h,
+        }
+        .clamp(0.12, 0.88);
+        let mut tree = std::mem::replace(&mut self.pane_tree, PaneNode::Leaf(0));
+        if set_split_ratio(&mut tree, &hit.path, ratio) {
+            self.pane_tree = tree;
+            self.relayout();
+            self.grid_dirty = true;
+            self.request_redraw();
+        } else {
+            self.pane_tree = tree;
+        }
     }
 
     // ---- event processing -------------------------------------------------
@@ -737,7 +1657,79 @@ impl PromptApp {
                 }
             }
         }
+        self.drain_inactive_panes();
         self.drain_background();
+    }
+
+    /// Keep the other split panes alive. Their state lives in `PaneSlot`s, so
+    /// events are applied there rather than through the active-pane fields.
+    fn drain_inactive_panes(&mut self) {
+        let active = self.active_pane;
+        let mut redraw = false;
+        let mut exited = Vec::new();
+        for slot in &mut self.panes {
+            if slot.id == active {
+                continue;
+            }
+            let Some(state) = &mut slot.state else {
+                continue;
+            };
+            let Some(pty) = &mut state.pty else { continue };
+            let data = pty.drain();
+            let mut changed = false;
+            if !data.is_empty() {
+                if let Some(session) = &mut state.session {
+                    let was_at_bottom = session.frame().scrollbar.at_bottom();
+                    session.write(&data);
+                    if was_at_bottom {
+                        session.scroll_to_bottom();
+                    }
+                    let replies = session.take_pty_replies();
+                    if !replies.is_empty() {
+                        pty.write(&replies);
+                    }
+                    changed = true;
+                }
+            }
+            let exit_code = pty.try_exit_code();
+            let events = state
+                .session
+                .as_mut()
+                .map(|session| session.drain_events())
+                .unwrap_or_default();
+            for event in events {
+                apply_pane_event(state, event);
+                changed = true;
+            }
+            if !state.got_prompt
+                && state.mode == Mode::Compose
+                && Instant::now() > state.integration_deadline
+            {
+                state.mode = Mode::Direct;
+                changed = true;
+            }
+            if changed {
+                if let Some(session) = &mut state.session {
+                    session.update_frame();
+                }
+            }
+            if let Some(code) = exit_code {
+                exited.push((slot.id, code));
+            }
+            if changed {
+                redraw = true;
+            }
+        }
+        for (id, code) in exited {
+            if self.panes.len() > 1 {
+                self.toast(format!("Pane shell exited ({code})"));
+                self.close_pane(id);
+            }
+        }
+        if redraw {
+            self.grid_dirty = true;
+            self.request_redraw();
+        }
     }
 
     /// Keep detached shells alive and up to date, even though they are not
@@ -1603,12 +2595,22 @@ impl PromptApp {
     }
 
     fn check_exit(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(pty) = &mut self.pty else { return };
-        let Some(code) = pty.try_exit_code() else { return };
+        let code = match self.pty.as_mut().and_then(|pty| pty.try_exit_code()) {
+            Some(code) => code,
+            None => return,
+        };
         if self.exited {
             return;
         }
         self.exited = true;
+
+        // A split pane closing should only close that pane.
+        if self.panes.len() > 1 {
+            self.toast(format!("Shell exited ({code})"));
+            self.close_active_pane();
+            self.exited = false;
+            return;
+        }
 
         // Exiting a shell closes that tab only. While other shells are still
         // running in the background panel, bring the most recent one forward
@@ -1648,6 +2650,10 @@ impl PromptApp {
             self.request_redraw();
         }
 
+        if self.animations_running() {
+            self.request_redraw();
+        }
+
         if let Some((_, at)) = &self.autotype {
             if now >= *at {
                 let command = self.autotype.take().map(|(cmd, _)| cmd).unwrap_or_default();
@@ -1684,6 +2690,16 @@ impl PromptApp {
         if self.mode == Mode::Running {
             next = next.min(now + Duration::from_millis(500));
         }
+        if self.panes.iter().any(|slot| {
+            slot.state
+                .as_ref()
+                .is_some_and(|state| state.mode == Mode::Running)
+        }) {
+            next = next.min(now + Duration::from_millis(500));
+            if now.duration_since(self.last_frame) >= Duration::from_millis(400) {
+                self.request_redraw();
+            }
+        }
         if self.background.iter().any(|tab| tab.mode == Mode::Running) {
             next = next.min(now + Duration::from_millis(500));
             if now.duration_since(self.last_frame) >= Duration::from_millis(400) {
@@ -1704,6 +2720,9 @@ impl PromptApp {
         }
         if self.dock_started.is_some() {
             self.request_redraw();
+            next = next.min(now + Duration::from_millis(16));
+        }
+        if self.animations_running() {
             next = next.min(now + Duration::from_millis(16));
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(next));
@@ -1805,14 +2824,51 @@ impl PromptApp {
             {
                 return;
             }
-            // Move the running command to the background panel.
+            // Splits. `Ctrl/Cmd+Shift+D` divides side by side; `E` stacks.
             if primary && shift && code == KeyCode::KeyD {
+                self.split_active(SplitAxis::Vertical);
+                return;
+            }
+            if primary && shift && code == KeyCode::KeyE {
+                self.split_active(SplitAxis::Horizontal);
+                return;
+            }
+            // Move the running command to the background panel. This used to
+            // be Ctrl/Cmd+Shift+D, which is now the split shortcut.
+            if primary && shift && code == KeyCode::KeyM {
                 self.detach_running();
                 return;
             }
-            if primary && shift && matches!(code, KeyCode::ArrowUp | KeyCode::ArrowDown) {
-                let direction = if code == KeyCode::ArrowUp { -1 } else { 1 };
-                self.jump_block(direction);
+            if primary && shift && code == KeyCode::KeyW {
+                self.close_active_pane();
+                return;
+            }
+            if primary && shift && (code == KeyCode::Enter || code == KeyCode::NumpadEnter) {
+                self.toggle_zoom();
+                return;
+            }
+            if primary
+                && shift
+                && matches!(
+                    code,
+                    KeyCode::ArrowUp
+                        | KeyCode::ArrowDown
+                        | KeyCode::ArrowLeft
+                        | KeyCode::ArrowRight
+                )
+            {
+                if self.panes.len() > 1 {
+                    let (dx, dy) = match code {
+                        KeyCode::ArrowUp => (0.0, -1.0),
+                        KeyCode::ArrowDown => (0.0, 1.0),
+                        KeyCode::ArrowLeft => (-1.0, 0.0),
+                        _ => (1.0, 0.0),
+                    };
+                    self.focus_direction(dx, dy);
+                } else if matches!(code, KeyCode::ArrowUp | KeyCode::ArrowDown) {
+                    let direction = if code == KeyCode::ArrowUp { -1 } else { 1 };
+                    self.jump_block(direction);
+                }
                 return;
             }
 
@@ -2763,6 +3819,9 @@ impl PromptApp {
             self.completion_popup = None;
             self.search = None;
         }
+        if state == ElementState::Released && self.drag_divider.take().is_some() {
+            return;
+        }
         if state == ElementState::Pressed && self.mouse_in_panel(x, y) {
             if let Some(entry) = self.panel_entry_at(x, y) {
                 if let Some((cx, cy, cw, ch)) = entry.close {
@@ -2774,6 +3833,25 @@ impl PromptApp {
                 self.attach_background(entry.tab);
             }
             return;
+        }
+        if state == ElementState::Pressed {
+            if let Some(divider) = self.divider_at(x, y) {
+                self.drag_divider = Some(divider);
+                return;
+            }
+            if let Some((id, action)) = self.control_at(x, y) {
+                self.run_pane_action(id, action);
+                return;
+            }
+            if let Some(id) = self.pane_at_point(x, y) {
+                if id != self.active_pane {
+                    self.focus_pane(id);
+                }
+                let layout = self.active_layout();
+                if layout.header.contains(x, y) {
+                    return;
+                }
+            }
         }
         // The composer is checked before the terminal: a multi-line composer
         // grows upwards over the top of the grid, and clicks on those lines
@@ -2896,6 +3974,36 @@ impl PromptApp {
                 self.trace_geometry()
             ));
         }
+        if self.drag_divider.is_some() {
+            self.update_divider_drag(x, y);
+            if let Some(window) = &self.window {
+                window.set_cursor(match self.drag_divider.as_ref().map(|d| d.axis) {
+                    Some(SplitAxis::Vertical) => winit::window::CursorIcon::ColResize,
+                    _ => winit::window::CursorIcon::RowResize,
+                });
+            }
+            return;
+        }
+        let hovered = self.control_at(x, y);
+        if hovered != self.hover_control {
+            self.hover_control = hovered;
+            self.request_redraw();
+        }
+        if hovered.is_some() {
+            if let Some(window) = &self.window {
+                window.set_cursor(winit::window::CursorIcon::Pointer);
+            }
+            return;
+        }
+        if let Some(divider) = self.divider_at(x, y) {
+            if let Some(window) = &self.window {
+                window.set_cursor(match divider.axis {
+                    SplitAxis::Vertical => winit::window::CursorIcon::ColResize,
+                    SplitAxis::Horizontal => winit::window::CursorIcon::RowResize,
+                });
+            }
+            return;
+        }
         if self.sel_drag {
             self.trace(format!(
                 "drag at ({:.1},{:.1}) zone={}",
@@ -2927,9 +4035,18 @@ impl PromptApp {
             if let Some(window) = &self.window {
                 window.set_cursor(winit::window::CursorIcon::Pointer);
             }
-        } else if self.mouse_in_card(x, y) || self.mouse_in_grid(x, y) {
+        } else if let Some(id) = self.pane_at_point(x, y) {
+            let over_card = self
+                .panes
+                .iter()
+                .find(|slot| slot.id == id)
+                .map(|slot| {
+                    let card = slot.layout.card;
+                    x >= card.x && x < card.x + card.w && y >= card.y && y < card.y + card.h
+                })
+                .unwrap_or(false);
             if let Some(window) = &self.window {
-                window.set_cursor(if self.mouse_in_card(x, y) {
+                window.set_cursor(if over_card {
                     winit::window::CursorIcon::Text
                 } else {
                     winit::window::CursorIcon::Default
@@ -2948,6 +4065,24 @@ impl PromptApp {
         if self.mouse_in_panel(x, y) {
             self.scroll_panel(lines * self.text.cell_h);
             return;
+        }
+        if let Some(id) = self.pane_at_point(x, y) {
+            if id != self.active_pane {
+                if let Some(state) = self
+                    .panes
+                    .iter_mut()
+                    .find(|slot| slot.id == id)
+                    .and_then(|slot| slot.state.as_mut())
+                {
+                    if let Some(session) = &mut state.session {
+                        session.scroll(lines.round() as i32);
+                        session.update_frame();
+                    }
+                    self.grid_dirty = true;
+                    self.request_redraw();
+                }
+                return;
+            }
         }
         if self.block_view.is_some() && (self.mouse_in_grid(x, y) || self.mouse_in_card(x, y)) {
             self.scroll_block(lines.round() as i64);
@@ -3207,6 +4342,8 @@ impl PromptApp {
             return;
         }
         self.advance_dock();
+        let now = Instant::now();
+        self.advance_pane_animations(now);
         self.size = size;
         let scale = window.scale_factor() as f32;
         if (scale - self.scale).abs() > 0.001 {
@@ -3232,12 +4369,25 @@ impl PromptApp {
         if let Some(session) = &mut self.session {
             session.update_frame();
         }
+        for slot in &mut self.panes {
+            if let Some(state) = &mut slot.state {
+                if let Some(session) = &mut state.session {
+                    session.update_frame();
+                }
+            }
+        }
+        for pane in &mut self.closing_panes {
+            if let Some(session) = &mut pane.state.session {
+                session.update_frame();
+            }
+        }
         self.apply_pending_highlight();
+        let split_mode = self.panes.len() > 1 || self.zoomed_pane.is_some();
         if self.grid_dirty {
             if let Some(cache) = &mut self.grid_cache {
                 cache.fill(self.theme.bg.solid());
             }
-            self.draw_grid();
+            self.paint_panes_into_cache(split_mode);
             self.grid_dirty = false;
         }
         let reveal = self.terminal_reveal();
@@ -3252,8 +4402,14 @@ impl PromptApp {
                 canvas.draw_pixmap(0, 0, cache.as_ref(), &paint, Transform::identity(), None);
             }
         }
-        self.draw_block_bar();
-        self.draw_card();
+        if split_mode {
+            self.draw_split_chrome();
+            self.draw_block_bar();
+        } else {
+            self.draw_block_bar();
+            self.draw_card((0.0, 0.0));
+            self.draw_single_controls();
+        }
         self.draw_background_panel();
         self.draw_welcome();
         self.draw_search();
@@ -3279,256 +4435,533 @@ impl PromptApp {
         self.last_frame = Instant::now();
     }
 
-    fn draw_grid(&mut self) {
-        let Some(canvas) = self.grid_cache.as_mut() else {
+    /// Paint every visible pane into the offscreen terminal cache: frames first,
+    /// then grids, then dividers. Headers and composers are drawn on the canvas
+    /// afterwards so they can use the full text painter.
+    fn paint_panes_into_cache(&mut self, split_mode: bool) {
+        let theme = self.theme.clone();
+        let scale = self.scale;
+        let cursor_on = self.cursor_on;
+        let active_id = self.active_pane;
+        let zoomed = self.zoomed_pane;
+        let Some(cache) = self.grid_cache.as_mut() else {
             return;
         };
-        let Some(session) = &self.session else { return };
-        let frame = session.frame();
-        let grid = self.grid;
-        let clip = Clip::new(grid.x, grid.y, grid.w, grid.h);
-        let cell_w = self.text.cell_w;
-        let cell_h = self.text.cell_h;
-        let mode = self.mode;
-        let cursor_on = self.cursor_on;
-        let scale = self.scale;
-        let theme = self.theme.clone();
         let mut painter = Painter {
-            pixmap: canvas,
+            pixmap: cache,
             text: &mut self.text,
-            scale: self.scale,
+            scale,
         };
 
-        painter.fill(grid.x, grid.y, grid.w, grid.h, frame.background, 1.0);
-
-        // Command blocks: a tinted command row plus a rail in the left margin,
-        // so commands stay distinguishable while scrolling through scrollback.
-        if !self.blocks.is_empty() && !frame.alt_screen {
-            let offset = frame.scrollbar.offset;
-            let row_count = frame.rows as u64;
-            let visible = offset..offset.saturating_add(row_count);
-            for block in &self.blocks {
-                let header = block.start_row;
-                let end = block
-                    .end_row
-                    .map(|row| row.saturating_sub(1))
-                    .unwrap_or(offset.saturating_add(row_count.saturating_sub(1)));
-                // A full-screen program can repaint the rows a block used to
-                // occupy (top, for example, stays on the primary screen). Only
-                // decorate the block when its command line is still there.
-                let expected: String = block
-                    .command
-                    .lines()
-                    .next()
-                    .unwrap_or_default()
-                    .trim()
-                    .chars()
-                    .take(24)
-                    .collect();
-                if expected.is_empty() {
+        if split_mode {
+            for slot in &self.panes {
+                if zoomed.is_some_and(|zoom| zoom != slot.id) {
                     continue;
                 }
-                let header_text = if visible.contains(&header) {
-                    frame.row_text((header - offset) as u16)
-                } else {
-                    None
-                };
-                let header_ok = header_text
-                    .as_deref()
-                    .map(|text| text.contains(&expected))
-                    .unwrap_or(false);
-                if !header_ok {
-                    continue;
-                }
-                let color = match block.status {
-                    None => theme.accent,
-                    Some(0) => theme.dim,
-                    Some(_) => theme.red,
-                };
-                if visible.contains(&header) {
-                    let y = grid.y + (header - offset) as f32 * cell_h;
-                    painter.fill(grid.x, y, grid.w, cell_h, theme.accent, 0.06);
-                    painter.rounded(
-                        grid.x - 12.0 * scale,
-                        y + (cell_h - 6.0 * scale) / 2.0,
-                        6.0 * scale,
-                        6.0 * scale,
-                        3.0 * scale,
-                        color,
-                        1.0,
-                    );
-                }
-                let first = header.max(offset);
-                let last = end.min(visible.end.saturating_sub(1));
-                if last >= first {
-                    let top = grid.y + (first - offset) as f32 * cell_h + cell_h * 0.15;
-                    let height = (last - first + 1) as f32 * cell_h - cell_h * 0.3;
-                    painter.fill(
-                        grid.x - 8.0 * scale,
-                        top,
-                        (2.0 * scale).max(1.0),
-                        height,
-                        color,
-                        0.5,
-                    );
-                }
+                paint_pane_frame(&mut painter, &theme, slot.anim, slot.id == active_id, scale);
             }
         }
-
-        let mut run: Option<Run> = None;
-        let mut run_y;
-        for row in &frame.rows_view {
-            let y_top = grid.y + row.y as f32 * cell_h;
-            run_y = y_top;
-            // Backgrounds and selection. Background first so selection stays
-            // visible over coloured cells (warnings, diffs, etc.).
-            for cell in &row.cells {
-                let cx = grid.x + cell.x as f32 * cell_w;
-                if let Some(bg) = cell.bg {
-                    if bg != frame.background {
-                        painter.fill(cx, y_top, cell_w, cell_h, bg, 1.0);
-                    }
-                }
-                let selected = row
-                    .selection
-                    .map(|(s, e)| cell.x >= s && cell.x <= e)
-                    .unwrap_or(false);
-                if selected {
-                    painter.fill(cx, y_top, cell_w, cell_h, theme.selection, 0.32);
-                }
-            }
-            for cell in &row.cells {
-                if cell.len == 0 || cell.flags.invisible {
-                    continue;
-                }
-                let mut text = String::with_capacity(cell.len as usize);
-                for cp in &cell.cps[..cell.len as usize] {
-                    if let Some(ch) = char::from_u32(*cp) {
-                        text.push(ch);
-                    }
-                }
-                let style = CellStyle {
-                    fg: if cell.flags.faint {
-                        cell.fg.lerp(frame.background, 0.55)
-                    } else {
-                        cell.fg
-                    },
-                    bold: cell.flags.bold,
-                    italic: cell.flags.italic,
-                    underline: cell.flags.underline,
-                    strikethrough: cell.flags.strikethrough,
-                    overline: cell.flags.overline,
-                    underline_color: cell.underline,
-                };
-                let columns = unicode_width::UnicodeWidthStr::width(text.as_str()).max(1) as u16;
-                let extend = run
-                    .as_ref()
-                    .map(|r| r.end_x == cell.x && r.style == style)
-                    .unwrap_or(false);
-                if extend {
-                    if let Some(r) = &mut run {
-                        r.text.push_str(&text);
-                        r.end_x = cell.x + columns;
-                    }
-                } else {
-                    if let Some(r) = run.take() {
-                        draw_run_at(
-                            &mut painter,
-                            &r,
-                            grid.x + r.x as f32 * cell_w,
-                            run_y,
-                            cell_w,
-                            cell_h,
-                            &clip,
-                        );
-                    }
-                    run = Some(Run {
-                        x: cell.x,
-                        end_x: cell.x + columns,
-                        text,
-                        style,
-                    });
-                }
-            }
-            if let Some(r) = run.take() {
-                draw_run_at(
-                    &mut painter,
-                    &r,
-                    grid.x + r.x as f32 * cell_w,
-                    run_y,
-                    cell_w,
-                    cell_h,
-                    &clip,
-                );
-            }
+        for pane in &self.closing_panes {
+            paint_pane_frame(&mut painter, &theme, pane.anim, false, scale);
         }
 
-        // Cursor.
-        if mode != Mode::Compose {
-            if let Some(cursor) = frame.cursor {
-                let show = !cursor.blinking || cursor_on;
-                if show {
-                    let cx = grid.x + cursor.x as f32 * cell_w;
-                    let cy = grid.y + cursor.y as f32 * cell_h;
-                    match cursor.style {
-                        CursorStyle::Bar => painter.fill(
-                            cx,
-                            cy,
-                            (cell_w * 0.12).max(2.0),
-                            cell_h,
-                            theme.cursor,
-                            0.9,
-                        ),
-                        CursorStyle::Block => {
-                            painter.fill(cx, cy, cell_w, cell_h, theme.cursor, 0.45)
-                        }
-                        CursorStyle::Underline => painter.fill(
-                            cx,
-                            cy + cell_h - (scale_line(self.scale)),
-                            cell_w,
-                            (2.0 * self.scale).max(1.5),
-                            theme.cursor,
-                            0.9,
-                        ),
-                        CursorStyle::HollowBlock => {
-                            painter.rounded_stroke(
-                                cx + 1.0,
-                                cy + 1.0,
-                                cell_w - 2.0,
-                                cell_h - 2.0,
-                                2.0,
-                                (1.5 * self.scale).max(1.0),
-                                theme.cursor,
-                                0.9,
-                            );
-                        }
-                    }
-                }
-            }
+        if let Some(session) = &self.session {
+            let (grid, clip) = if split_mode {
+                self.panes
+                    .iter()
+                    .find(|slot| slot.id == active_id)
+                    .map(|slot| {
+                        (
+                            shifted_grid(slot.layout.grid, slot.anim, slot.layout.rect),
+                            Some(slot.anim.clip()),
+                        )
+                    })
+                    .unwrap_or((self.grid, None))
+            } else {
+                (self.grid, None)
+            };
+            paint_grid(
+                &mut painter,
+                &theme,
+                session,
+                &self.blocks,
+                grid,
+                self.mode,
+                cursor_on,
+                true,
+                clip,
+            );
         }
 
-        // Scrollbar.
-        let sb = frame.scrollbar;
-        if sb.total > sb.len && sb.len > 0 {
-            let track_x = grid.x + grid.w - (6.0 * self.scale);
-            let track_w = (3.0 * self.scale).max(2.0);
-            painter.fill(track_x, grid.y, track_w, grid.h, theme.dim, 0.12);
-            let frac = sb.offset as f32 / sb.total.max(1) as f32;
-            let thumb_h = (grid.h * (sb.len as f32 / sb.total as f32)).max(16.0 * self.scale);
-            let thumb_y = grid.y + frac * (grid.h - thumb_h);
-            painter.rounded(
-                track_x,
-                thumb_y,
-                track_w,
-                thumb_h,
-                track_w / 2.0,
-                theme.dim,
-                0.45,
+        for slot in &self.panes {
+            if slot.id == active_id || zoomed.is_some_and(|zoom| zoom != slot.id) {
+                continue;
+            }
+            let Some(state) = &slot.state else { continue };
+            let Some(session) = &state.session else {
+                continue;
+            };
+            let grid = shifted_grid(slot.layout.grid, slot.anim, slot.layout.rect);
+            paint_grid(
+                &mut painter,
+                &theme,
+                session,
+                &state.blocks,
+                grid,
+                state.mode,
+                cursor_on,
+                false,
+                Some(slot.anim.clip()),
+            );
+        }
+
+        for pane in &self.closing_panes {
+            let Some(session) = &pane.state.session else {
+                continue;
+            };
+            let grid = shifted_grid(pane.layout.grid, pane.anim, pane.layout.rect);
+            paint_grid(
+                &mut painter,
+                &theme,
+                session,
+                &pane.state.blocks,
+                grid,
+                pane.state.mode,
+                cursor_on,
+                false,
+                Some(pane.anim.clip()),
+            );
+        }
+
+        if split_mode {
+            draw_dividers(
+                &mut painter,
+                &theme,
+                &self.dividers,
+                self.drag_divider.as_ref(),
+                scale,
             );
         }
     }
 
-    fn draw_card(&mut self) {
+    /// Headers, composer cards and controls for split mode.
+    fn draw_split_chrome(&mut self) {
+        let split_mode = self.panes.len() > 1 || self.zoomed_pane.is_some();
+        if !split_mode {
+            return;
+        }
+        let ids: Vec<u64> = self
+            .panes
+            .iter()
+            .filter(|slot| self.zoomed_pane.map(|zoom| zoom == slot.id).unwrap_or(true))
+            .map(|slot| slot.id)
+            .collect();
+        for id in ids {
+            self.draw_pane_header(id);
+            if id == self.active_pane {
+                let Some(slot) = self.panes.iter().find(|slot| slot.id == id) else {
+                    continue;
+                };
+                let offset = (
+                    slot.anim.x - slot.layout.rect.x,
+                    slot.anim.y - slot.layout.rect.y,
+                );
+                let ready =
+                    slot.anim.w >= slot.target.w * 0.4 && slot.anim.h >= slot.target.h * 0.4;
+                if ready {
+                    self.draw_card(offset);
+                }
+            } else {
+                self.draw_inactive_card(id);
+            }
+        }
+        // Closing panes keep their chrome during the close animation.
+        let closing = std::mem::take(&mut self.closing_panes);
+        for pane in &closing {
+            let dx = pane.anim.x - pane.layout.rect.x;
+            let dy = pane.anim.y - pane.layout.rect.y;
+            let clip = pane.anim.clip();
+            self.draw_pane_header_from(&pane.layout, &pane.state, false, (dx, dy), clip);
+            self.draw_inactive_card_from(&pane.layout, &pane.state, (dx, dy), clip);
+        }
+        self.closing_panes = closing;
+    }
+
+    fn draw_single_controls(&mut self) {
+        if self.panes.len() > 1 || self.single_controls.is_empty() {
+            return;
+        }
+        let controls = self.single_controls.clone();
+        let hovered = self.hover_control.map(|(_, action)| action);
+        let cell_h = self.text.cell_h;
+        let scale = self.scale;
+        let theme = self.theme.clone();
+        let Some(canvas) = self.canvas.as_mut() else {
+            return;
+        };
+        let mut painter = Painter {
+            pixmap: canvas,
+            text: &mut self.text,
+            scale,
+        };
+        for control in controls {
+            let is_hover = hovered == Some(control.action);
+            let bg = if is_hover {
+                theme.panel_raised
+            } else {
+                theme.panel
+            };
+            painter.rounded(
+                control.rect.x,
+                control.rect.y,
+                control.rect.w,
+                control.rect.h,
+                6.0 * scale,
+                bg,
+                0.94,
+            );
+            painter.rounded_stroke(
+                control.rect.x,
+                control.rect.y,
+                control.rect.w,
+                control.rect.h,
+                6.0 * scale,
+                scale.max(1.0),
+                theme.border,
+                0.7,
+            );
+            let label = match control.action {
+                PaneAction::SplitVertical => "split →",
+                PaneAction::SplitHorizontal => "split ↓",
+                PaneAction::Zoom => "zoom",
+                PaneAction::Close => "×",
+            };
+            painter.text(
+                control.rect.x + 9.0 * scale,
+                control.rect.y + (control.rect.h - cell_h) / 2.0,
+                label,
+                if is_hover { theme.fg } else { theme.dim },
+                false,
+                None,
+                control.rect.clip(),
+                control.rect.w,
+            );
+        }
+    }
+
+    fn draw_pane_header(&mut self, id: u64) {
+        let Some(slot) = self.panes.iter().find(|slot| slot.id == id) else {
+            return;
+        };
+        let layout = slot.layout.clone();
+        let offset = (slot.anim.x - layout.rect.x, slot.anim.y - layout.rect.y);
+        let clip = slot.anim.clip();
+        if id == self.active_pane {
+            let title = format!("{} · {}", self.launch.kind.name(), display_path(&self.cwd));
+            let mode = self.mode;
+            let controls = layout.controls.clone();
+            self.draw_header_common(&layout, &title, mode, &controls, true, offset, clip, id);
+        } else if let Some(state) = &slot.state {
+            let state: *const PaneState = state;
+            let state = unsafe { &*state };
+            self.draw_pane_header_from(&layout, state, false, offset, clip);
+        }
+    }
+
+    fn draw_pane_header_from(
+        &mut self,
+        layout: &PaneLayout,
+        state: &PaneState,
+        active: bool,
+        offset: (f32, f32),
+        clip: Clip,
+    ) {
+        let title = format!("{} · {}", self.launch.kind.name(), display_path(&state.cwd));
+        let controls = layout.controls.clone();
+        self.draw_header_common(
+            layout,
+            &title,
+            state.mode,
+            &controls,
+            active,
+            offset,
+            clip,
+            u64::MAX,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_header_common(
+        &mut self,
+        layout: &PaneLayout,
+        title: &str,
+        mode: Mode,
+        controls: &[PaneControl],
+        active: bool,
+        offset: (f32, f32),
+        clip: Clip,
+        hover_id: u64,
+    ) {
+        let cell_h = self.text.cell_h;
+        let scale = self.scale;
+        let theme = self.theme.clone();
+        if clip.w <= 0.5 || clip.h <= 0.5 {
+            return;
+        }
+        let Some(canvas) = self.canvas.as_mut() else {
+            return;
+        };
+        let mut painter = Painter {
+            pixmap: canvas,
+            text: &mut self.text,
+            scale,
+        };
+        let header = Rect::new(
+            layout.header.x + offset.0,
+            layout.header.y + offset.1,
+            layout.header.w,
+            layout.header.h,
+        );
+        fill_clipped(
+            &mut painter,
+            clip,
+            header.x,
+            header.y,
+            header.w,
+            header.h,
+            theme.panel_raised,
+            if active { 0.85 } else { 0.55 },
+        );
+        let dot = match mode {
+            Mode::Compose => theme.accent,
+            Mode::Running => theme.yellow,
+            Mode::Direct => theme.red,
+        };
+        fill_clipped(
+            &mut painter,
+            clip,
+            header.x + 10.0 * scale,
+            header.y + (header.h - 6.0 * scale) / 2.0,
+            6.0 * scale,
+            6.0 * scale,
+            dot,
+            1.0,
+        );
+        let text_x = header.x + 22.0 * scale;
+        let controls_left = controls
+            .iter()
+            .map(|control| control.rect.x + offset.0)
+            .fold(header.right(), f32::min);
+        let text_w = (controls_left - text_x - 8.0 * scale).max(10.0);
+        painter.text(
+            text_x,
+            header.y + (header.h - cell_h) / 2.0,
+            title,
+            if active { theme.fg } else { theme.dim },
+            active,
+            None,
+            Clip::new(text_x, header.y, text_w, header.h).intersect(clip),
+            text_w,
+        );
+        let hovered = self.hover_control;
+        for control in controls {
+            let rect = Rect::new(
+                control.rect.x + offset.0,
+                control.rect.y + offset.1,
+                control.rect.w,
+                control.rect.h,
+            );
+            let is_hover = hovered.map(|(_, action)| action) == Some(control.action)
+                && (hover_id == u64::MAX || hovered.map(|(id, _)| id) == Some(hover_id));
+            let bg = if is_hover { theme.accent } else { theme.panel };
+            fill_clipped(
+                &mut painter,
+                clip,
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+                bg,
+                if is_hover { 0.22 } else { 0.75 },
+            );
+            let label = match control.action {
+                PaneAction::SplitVertical => {
+                    if rect.w > 60.0 * scale {
+                        "split →"
+                    } else {
+                        "⇄"
+                    }
+                }
+                PaneAction::SplitHorizontal => {
+                    if rect.w > 60.0 * scale {
+                        "split ↓"
+                    } else {
+                        "⇅"
+                    }
+                }
+                PaneAction::Zoom => {
+                    if self.zoomed_pane == Some(self.active_pane) {
+                        if rect.w > 64.0 * scale {
+                            "unzoom"
+                        } else {
+                            "⤢"
+                        }
+                    } else if rect.w > 50.0 * scale {
+                        "zoom"
+                    } else {
+                        "⤢"
+                    }
+                }
+                PaneAction::Close => "×",
+            };
+            painter.text(
+                rect.x + 8.0 * scale,
+                rect.y + (rect.h - cell_h) / 2.0,
+                label,
+                if is_hover { theme.fg } else { theme.dim },
+                false,
+                None,
+                rect.clip().intersect(clip),
+                rect.w,
+            );
+        }
+    }
+
+    fn draw_inactive_card(&mut self, id: u64) {
+        let Some(slot) = self.panes.iter().find(|slot| slot.id == id) else {
+            return;
+        };
+        let Some(state) = &slot.state else { return };
+        let layout = slot.layout.clone();
+        let offset = (slot.anim.x - layout.rect.x, slot.anim.y - layout.rect.y);
+        let clip = slot.anim.clip();
+        let state = state as *const PaneState;
+        // The raw pointer keeps the immutable pane state and the mutable text
+        // engine/canvas borrows separate; it lives for this call only.
+        let state = unsafe { &*state };
+        self.draw_inactive_card_from(&layout, state, offset, clip);
+    }
+
+    fn draw_inactive_card_from(
+        &mut self,
+        layout: &PaneLayout,
+        state: &PaneState,
+        offset: (f32, f32),
+        clip: Clip,
+    ) {
+        let cell_h = self.text.cell_h;
+        let cell_w = self.text.cell_w;
+        let scale = self.scale;
+        let theme = self.theme.clone();
+        if clip.w <= 0.5 || clip.h <= 0.5 {
+            return;
+        }
+        let Some(canvas) = self.canvas.as_mut() else {
+            return;
+        };
+        let mut painter = Painter {
+            pixmap: canvas,
+            text: &mut self.text,
+            scale,
+        };
+        let card = Rect::new(
+            layout.card.x + offset.0,
+            layout.card.y + offset.1,
+            layout.card.w,
+            layout.card.h,
+        );
+        fill_clipped(
+            &mut painter,
+            clip,
+            card.x,
+            card.y,
+            card.w,
+            card.h,
+            theme.panel,
+            0.95,
+        );
+        let pad = 10.0 * scale;
+        let glyph_x = card.x + pad;
+        let (glyph, glyph_color) = match state.mode {
+            Mode::Compose => ("❯", theme.accent),
+            Mode::Running => ("●", theme.yellow),
+            Mode::Direct => ("!", theme.red),
+        };
+        painter.text(
+            glyph_x,
+            card.y + pad,
+            glyph,
+            glyph_color,
+            false,
+            Some(cell_w),
+            Clip::new(glyph_x, card.y, cell_w * 2.0, cell_h).intersect(clip),
+            cell_w * 2.0,
+        );
+        let text_x = glyph_x + cell_w + 8.0 * scale;
+        let text_w = (card.right() - pad - text_x).max(10.0);
+        let lines = ((card.h - pad * 2.0) / cell_h).floor().max(1.0) as usize;
+        if state.mode == Mode::Running {
+            let elapsed = state.running_started.elapsed().as_secs_f32();
+            let label = if state.running_cmd.is_empty() {
+                "running…".to_string()
+            } else {
+                format!("{}  ·  {elapsed:.1}s", state.running_cmd)
+            };
+            painter.text(
+                text_x,
+                card.y + pad,
+                &label,
+                theme.yellow,
+                false,
+                None,
+                Clip::new(text_x, card.y + pad, text_w, cell_h).intersect(clip),
+                text_w,
+            );
+        } else if state.mode == Mode::Direct {
+            painter.text(
+                text_x,
+                card.y + pad,
+                "classic input — click to focus",
+                theme.dim,
+                false,
+                None,
+                Clip::new(text_x, card.y + pad, text_w, cell_h).intersect(clip),
+                text_w,
+            );
+        } else {
+            let mut hscroll = state.hscroll;
+            let mut composer_scroll = state.composer_scroll;
+            draw_editor(
+                &mut painter,
+                &theme,
+                &state.editor,
+                Focus::Grid,
+                false,
+                "",
+                None,
+                &mut hscroll,
+                &mut composer_scroll,
+                text_x,
+                card.y + pad,
+                text_w,
+                lines,
+            );
+            if state.editor.is_empty() {
+                painter.text(
+                    text_x,
+                    card.y + pad,
+                    "click to focus this pane",
+                    theme.faint,
+                    false,
+                    None,
+                    Clip::new(text_x, card.y + pad, text_w, cell_h).intersect(clip),
+                    text_w,
+                );
+            }
+        }
+    }
+
+    fn draw_card(&mut self, offset: (f32, f32)) {
         let width = self.size.width as f32;
         let height = self.size.height as f32;
         let scale = self.scale;
@@ -3544,34 +4977,47 @@ impl PromptApp {
         };
         let mode = self.mode;
         let block_view = self.block_view.is_some();
-        let lines = if block_view {
+        let split_mode = self.panes.len() > 1 || self.zoomed_pane.is_some();
+        let mut lines = if block_view {
             1
         } else if mode == Mode::Compose {
             self.editor.line_count().clamp(1, 10)
         } else {
             1
         };
-        let card_h = pad * 2.0 + lines as f32 * cell_h + s(6.0) + hint_h;
-        let dock = self.dock_progress.clamp(0.0, 1.0);
-        // The background panel owns the right rail: keep the composer clear of
-        // it instead of drawing underneath.
-        let reserved = if self.panel.w > 0.0 {
-            self.panel.w + s(10.0)
+        let (card_x, card_y, card_w, card_h) = if split_mode {
+            let target = self.card;
+            lines = (((target.h - pad * 2.0 - s(4.0) - hint_h) / cell_h)
+                .floor()
+                .max(1.0)) as usize;
+            (target.x + offset.0, target.y + offset.1, target.w, target.h)
         } else {
-            0.0
+            let card_h = pad * 2.0 + lines as f32 * cell_h + s(6.0) + hint_h;
+            let dock = self.dock_progress.clamp(0.0, 1.0);
+            // The background panel owns the right rail: keep the composer clear
+            // of it instead of drawing underneath.
+            let reserved = if self.panel.w > 0.0 {
+                self.panel.w + s(10.0)
+            } else {
+                0.0
+            };
+            let docked_w = (width - margin * 2.0 - reserved).max(1.0);
+            let centred_w = (760.0 * scale).min(docked_w);
+            let card_w = centred_w + (docked_w - centred_w) * dock;
+            let card_x = margin + (docked_w - card_w) / 2.0;
+            let docked_y = height - margin - card_h;
+            let centred_y = ((height - card_h) / 2.0).max(margin);
+            let card_y = centred_y + (docked_y - centred_y) * dock;
+            (card_x, card_y, card_w, card_h)
         };
-        let docked_w = (width - margin * 2.0 - reserved).max(1.0);
-        let centred_w = (760.0 * scale).min(docked_w);
-        let card_w = centred_w + (docked_w - centred_w) * dock;
-        let card_x = margin + (docked_w - card_w) / 2.0;
-        let docked_y = height - margin - card_h;
-        let centred_y = ((height - card_h) / 2.0).max(margin);
-        let card_y = centred_y + (docked_y - centred_y) * dock;
 
         let theme = self.theme.clone();
         let cwd_label = self.cwd_display();
         let cwd_w = self.text.measure_text(&cwd_label, false);
-        let chip_w = (cwd_w + 18.0 * scale).min(280.0 * scale);
+        let chip_w = (cwd_w + 18.0 * scale)
+            .min(280.0 * scale)
+            .min(card_w * 0.45)
+            .max(10.0);
         let chip_h = (cell_h - 2.0 * scale).max(10.0);
         let chip_y = card_y + pad + (cell_h - chip_h) / 2.0;
         let prompt_w = cell_w;
@@ -3603,14 +5049,19 @@ impl PromptApp {
             None
         };
 
-        self.card = CardLayout {
-            x: card_x,
-            y: card_y,
-            w: card_w,
-            h: card_h,
-            text_x,
-            text_y,
-        };
+        if split_mode {
+            self.card.text_x = (text_x - offset.0).max(self.card.x);
+            self.card.text_y = (text_y - offset.1).max(self.card.y);
+        } else {
+            self.card = CardLayout {
+                x: card_x,
+                y: card_y,
+                w: card_w,
+                h: card_h,
+                text_x,
+                text_y,
+            };
+        }
         self.detach_rect = None;
 
         let Some(canvas) = self.canvas.as_mut() else {
@@ -3761,7 +5212,7 @@ impl PromptApp {
                     btn_clip,
                     btn_w,
                 );
-                self.detach_rect = Some((bx, by, btn_w, btn_h));
+                self.detach_rect = Some((bx - offset.0, by - offset.1, btn_w, btn_h));
             }
         } else {
             painter.text(
@@ -3802,7 +5253,7 @@ impl PromptApp {
                         "enter run   shift+enter newline   ↑↓ history   ^R search   ^V paste"
                     }
                 }
-                Mode::Running => "running — ctrl-c to interrupt   ctrl-shift-d background",
+                Mode::Running => "running — ctrl-c to interrupt   ctrl-shift-m background",
                 Mode::Direct => "this shell has no prompt integration; use zsh or bash",
             }
         };
@@ -3811,7 +5262,7 @@ impl PromptApp {
         } else {
             match mode {
                 Mode::Compose => "enter run   ↑ history   tab autocomplete",
-                Mode::Running => "running — ctrl-c stops   ctrl-shift-d background",
+                Mode::Running => "running — ctrl-c stops   ctrl-shift-m background",
                 Mode::Direct => "classic input — zsh/bash enable the composer",
             }
         };
@@ -4079,7 +5530,11 @@ impl PromptApp {
         let w = (text_w + pad * 2.0).min(grid.w).max(40.0 * scale);
         let h = cell_h + 2.0 * scale;
         let x = grid.x;
-        let y = (2.0 * scale).min((grid.y - h).max(1.0));
+        let y = if self.panes.len() > 1 {
+            grid.y + 2.0 * scale
+        } else {
+            (2.0 * scale).min((grid.y - h).max(1.0))
+        };
         painter.rounded(x, y, w, h, 5.0 * scale, theme.panel_raised, 1.0);
         painter.rounded_stroke(x, y, w, h, 5.0 * scale, scale.max(1.0), theme.border, 0.9);
         painter.text(
@@ -4590,6 +6045,596 @@ impl PromptApp {
     }
 }
 
+fn layout_pane_leaf(
+    id: u64,
+    area: Rect,
+    card_heights: &[(u64, f32)],
+    cell_w: f32,
+    cell_h: f32,
+    scale: f32,
+    layouts: &mut Vec<(u64, PaneLayout)>,
+) {
+    let s = |v: f32| (v * scale).round();
+    let header_h = s(24.0);
+    let pad = s(6.0);
+    let card_h = card_heights
+        .iter()
+        .find(|(pane, _)| *pane == id)
+        .map(|(_, height)| *height)
+        .unwrap_or(cell_h * 3.0 + s(20.0))
+        .min((area.h - header_h - pad * 3.0 - cell_h * 2.0).max(cell_h + s(8.0)));
+    let card = Rect::new(
+        area.x + pad,
+        area.y + area.h - pad - card_h,
+        (area.w - pad * 2.0).max(1.0),
+        card_h.max(1.0),
+    );
+    let grid_avail_w = (area.w - pad * 2.0).max(1.0);
+    let grid_avail_h = (card.y - (area.y + header_h + pad) - pad).max(1.0);
+    let cols = ((grid_avail_w / cell_w).floor() as u16).max(4);
+    let rows = ((grid_avail_h / cell_h).floor() as u16).max(2);
+    let grid = GridLayout {
+        x: area.x + pad,
+        y: area.y + header_h + pad,
+        w: cols as f32 * cell_w,
+        h: rows as f32 * cell_h,
+        cols,
+        rows,
+    };
+    let chip_w = (s(180.0)).min(card.w * 0.35).max(s(40.0));
+    let text_x = card.x + s(12.0) + chip_w + s(14.0) + cell_w + s(10.0);
+    let card_layout = CardLayout {
+        x: card.x,
+        y: card.y,
+        w: card.w,
+        h: card.h,
+        text_x: text_x.min(card.right() - s(16.0)).max(card.x + s(12.0)),
+        text_y: card.y + s(10.0),
+    };
+    layouts.push((
+        id,
+        PaneLayout {
+            rect: area,
+            header: Rect::new(area.x, area.y, area.w, header_h),
+            grid,
+            card: card_layout,
+            controls: Vec::new(),
+        },
+    ));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn layout_pane_node(
+    node: &PaneNode,
+    area: Rect,
+    card_heights: &[(u64, f32)],
+    cell_w: f32,
+    cell_h: f32,
+    scale: f32,
+    layouts: &mut Vec<(u64, PaneLayout)>,
+    dividers: &mut Vec<DividerHit>,
+    path: &mut Vec<bool>,
+) {
+    match node {
+        PaneNode::Leaf(id) => {
+            layout_pane_leaf(*id, area, card_heights, cell_w, cell_h, scale, layouts)
+        }
+        PaneNode::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => {
+            let gap = (6.0 * scale).round().max(4.0);
+            let (avail, first_extent) = match axis {
+                SplitAxis::Vertical => ((area.w - gap).max(1.0), ((area.w - gap) * ratio).round()),
+                SplitAxis::Horizontal => {
+                    ((area.h - gap).max(1.0), ((area.h - gap) * ratio).round())
+                }
+            };
+            let first_extent = first_extent.clamp(1.0, (avail - 1.0).max(1.0));
+            let second_extent = (avail - first_extent).max(1.0);
+            let (first_area, divider, second_area) = match axis {
+                SplitAxis::Vertical => (
+                    Rect::new(area.x, area.y, first_extent, area.h),
+                    Rect::new(area.x + first_extent, area.y, gap, area.h),
+                    Rect::new(area.x + first_extent + gap, area.y, second_extent, area.h),
+                ),
+                SplitAxis::Horizontal => (
+                    Rect::new(area.x, area.y, area.w, first_extent),
+                    Rect::new(area.x, area.y + first_extent, area.w, gap),
+                    Rect::new(area.x, area.y + first_extent + gap, area.w, second_extent),
+                ),
+            };
+            // Grow the hit target a little past the visual gap.
+            let hit = 2.0 * scale;
+            let divider_rect = match axis {
+                SplitAxis::Vertical => {
+                    Rect::new(divider.x - hit, divider.y, divider.w + hit * 2.0, divider.h)
+                }
+                SplitAxis::Horizontal => {
+                    Rect::new(divider.x, divider.y - hit, divider.w, divider.h + hit * 2.0)
+                }
+            };
+            dividers.push(DividerHit {
+                rect: divider_rect,
+                axis: *axis,
+                path: path.clone(),
+                area,
+            });
+            path.push(false);
+            layout_pane_node(
+                first,
+                first_area,
+                card_heights,
+                cell_w,
+                cell_h,
+                scale,
+                layouts,
+                dividers,
+                path,
+            );
+            path.pop();
+            path.push(true);
+            layout_pane_node(
+                second,
+                second_area,
+                card_heights,
+                cell_w,
+                cell_h,
+                scale,
+                layouts,
+                dividers,
+                path,
+            );
+            path.pop();
+        }
+    }
+}
+
+fn split_leaf(node: PaneNode, target: u64, new_id: u64, axis: SplitAxis) -> PaneNode {
+    match node {
+        PaneNode::Leaf(id) if id == target => PaneNode::Split {
+            axis,
+            ratio: 0.5,
+            first: Box::new(PaneNode::Leaf(id)),
+            second: Box::new(PaneNode::Leaf(new_id)),
+        },
+        PaneNode::Leaf(id) => PaneNode::Leaf(id),
+        PaneNode::Split {
+            axis: split_axis,
+            ratio,
+            first,
+            second,
+        } => PaneNode::Split {
+            axis: split_axis,
+            ratio,
+            first: Box::new(split_leaf(*first, target, new_id, axis)),
+            second: Box::new(split_leaf(*second, target, new_id, axis)),
+        },
+    }
+}
+
+fn remove_leaf(node: PaneNode, target: u64) -> Option<PaneNode> {
+    match node {
+        PaneNode::Leaf(id) if id == target => None,
+        PaneNode::Leaf(id) => Some(PaneNode::Leaf(id)),
+        PaneNode::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => {
+            if matches!(*first, PaneNode::Leaf(id) if id == target) {
+                return Some(*second);
+            }
+            if matches!(*second, PaneNode::Leaf(id) if id == target) {
+                return Some(*first);
+            }
+            match (
+                remove_leaf(*first.clone(), target),
+                remove_leaf(*second.clone(), target),
+            ) {
+                (Some(next_first), Some(next_second)) => Some(PaneNode::Split {
+                    axis,
+                    ratio,
+                    first: Box::new(next_first),
+                    second: Box::new(next_second),
+                }),
+                (Some(next_first), None) => Some(next_first),
+                (None, Some(next_second)) => Some(next_second),
+                (None, None) => None,
+            }
+        }
+    }
+}
+
+fn set_split_ratio(node: &mut PaneNode, path: &[bool], ratio: f32) -> bool {
+    if path.is_empty() {
+        return match node {
+            PaneNode::Split { ratio: current, .. } => {
+                *current = ratio.clamp(0.12, 0.88);
+                true
+            }
+            PaneNode::Leaf(_) => false,
+        };
+    }
+    let step = path[0];
+    match node {
+        PaneNode::Leaf(_) => false,
+        PaneNode::Split { first, second, .. } => {
+            if step {
+                set_split_ratio(second, &path[1..], ratio)
+            } else {
+                set_split_ratio(first, &path[1..], ratio)
+            }
+        }
+    }
+}
+
+fn lerp_rect(from: Rect, to: Rect, t: f32) -> Rect {
+    Rect {
+        x: from.x + (to.x - from.x) * t,
+        y: from.y + (to.y - from.y) * t,
+        w: from.w + (to.w - from.w) * t,
+        h: from.h + (to.h - from.h) * t,
+    }
+}
+
+fn shifted_grid(mut grid: GridLayout, anim: Rect, target: Rect) -> GridLayout {
+    grid.x += anim.x - target.x;
+    grid.y += anim.y - target.y;
+    grid
+}
+
+fn fill_clipped(
+    painter: &mut Painter,
+    clip: Clip,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    color: Rgb,
+    alpha: f32,
+) {
+    let left = x.max(clip.x);
+    let top = y.max(clip.y);
+    let right = (x + w).min(clip.x + clip.w);
+    let bottom = (y + h).min(clip.y + clip.h);
+    if right > left && bottom > top {
+        painter.fill(left, top, right - left, bottom - top, color, alpha);
+    }
+}
+
+fn paint_pane_frame(painter: &mut Painter, theme: &Theme, rect: Rect, active: bool, scale: f32) {
+    if rect.w <= 1.0 || rect.h <= 1.0 {
+        return;
+    }
+    let radius = 12.0 * scale;
+    painter.rounded(
+        rect.x,
+        rect.y + 3.0 * scale,
+        rect.w,
+        rect.h,
+        radius,
+        theme.shadow,
+        0.35,
+    );
+    painter.rounded(rect.x, rect.y, rect.w, rect.h, radius, theme.panel, 1.0);
+    painter.rounded_stroke(
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        radius,
+        scale.max(1.0),
+        if active { theme.accent } else { theme.border },
+        if active { 0.55 } else { 0.7 },
+    );
+}
+
+fn draw_dividers(
+    painter: &mut Painter,
+    theme: &Theme,
+    dividers: &[DividerHit],
+    dragging: Option<&DividerHit>,
+    scale: f32,
+) {
+    for divider in dividers {
+        let active = dragging
+            .map(|drag| drag.path == divider.path && drag.axis == divider.axis)
+            .unwrap_or(false);
+        let width = if active { 3.0 } else { 1.0 } * scale;
+        let color = if active { theme.accent } else { theme.border };
+        let alpha = if active { 0.95 } else { 0.6 };
+        match divider.axis {
+            SplitAxis::Vertical => {
+                let x = divider.rect.x + (divider.rect.w - width) / 2.0;
+                painter.fill(x, divider.rect.y, width, divider.rect.h, color, alpha);
+            }
+            SplitAxis::Horizontal => {
+                let y = divider.rect.y + (divider.rect.h - width) / 2.0;
+                painter.fill(divider.rect.x, y, divider.rect.w, width, color, alpha);
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_grid(
+    painter: &mut Painter,
+    theme: &Theme,
+    session: &TerminalSession,
+    blocks: &[Block],
+    grid: GridLayout,
+    mode: Mode,
+    cursor_on: bool,
+    active: bool,
+    outer_clip: Option<Clip>,
+) {
+    let frame = session.frame();
+    let base_clip = Clip::new(grid.x, grid.y, grid.w, grid.h);
+    let clip = outer_clip
+        .map(|outer| base_clip.intersect(outer))
+        .unwrap_or(base_clip);
+    if clip.w <= 0.5 || clip.h <= 0.5 {
+        return;
+    }
+    let cell_w = painter.text.cell_w;
+    let cell_h = painter.text.cell_h;
+    let scale = painter.scale;
+
+    fill_clipped(
+        painter,
+        clip,
+        grid.x,
+        grid.y,
+        grid.w,
+        grid.h,
+        frame.background,
+        1.0,
+    );
+
+    // Command blocks: a tinted command row plus a rail in the left margin,
+    // so commands stay distinguishable while scrolling through scrollback.
+    if !blocks.is_empty() && !frame.alt_screen {
+        let offset = frame.scrollbar.offset;
+        let row_count = frame.rows as u64;
+        let visible = offset..offset.saturating_add(row_count);
+        for block in blocks {
+            let header = block.start_row;
+            let end = block
+                .end_row
+                .map(|row| row.saturating_sub(1))
+                .unwrap_or(offset.saturating_add(row_count.saturating_sub(1)));
+            // A full-screen program can repaint the rows a block used to
+            // occupy (top, for example, stays on the primary screen). Only
+            // decorate the block when its command line is still there.
+            let expected: String = block
+                .command
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .chars()
+                .take(24)
+                .collect();
+            if expected.is_empty() {
+                continue;
+            }
+            let header_text = if visible.contains(&header) {
+                frame.row_text((header - offset) as u16)
+            } else {
+                None
+            };
+            let header_ok = header_text
+                .as_deref()
+                .map(|text| text.contains(&expected))
+                .unwrap_or(false);
+            if !header_ok {
+                continue;
+            }
+            let color = match block.status {
+                None => theme.accent,
+                Some(0) => theme.dim,
+                Some(_) => theme.red,
+            };
+            if visible.contains(&header) {
+                let y = grid.y + (header - offset) as f32 * cell_h;
+                fill_clipped(painter, clip, grid.x, y, grid.w, cell_h, theme.accent, 0.06);
+                fill_clipped(
+                    painter,
+                    clip,
+                    grid.x - 12.0 * scale,
+                    y + (cell_h - 6.0 * scale) / 2.0,
+                    6.0 * scale,
+                    6.0 * scale,
+                    color,
+                    1.0,
+                );
+            }
+            let first = header.max(offset);
+            let last = end.min(visible.end.saturating_sub(1));
+            if last >= first {
+                let top = grid.y + (first - offset) as f32 * cell_h + cell_h * 0.15;
+                let height = (last - first + 1) as f32 * cell_h - cell_h * 0.3;
+                fill_clipped(
+                    painter,
+                    clip,
+                    grid.x - 8.0 * scale,
+                    top,
+                    (2.0 * scale).max(1.0),
+                    height,
+                    color,
+                    0.5,
+                );
+            }
+        }
+    }
+
+    let mut run: Option<Run> = None;
+    let mut run_y;
+    for row in &frame.rows_view {
+        let y_top = grid.y + row.y as f32 * cell_h;
+        run_y = y_top;
+        // Backgrounds and selection. Background first so selection stays
+        // visible over coloured cells (warnings, diffs, etc.).
+        for cell in &row.cells {
+            let cx = grid.x + cell.x as f32 * cell_w;
+            if let Some(bg) = cell.bg {
+                if bg != frame.background {
+                    fill_clipped(painter, clip, cx, y_top, cell_w, cell_h, bg, 1.0);
+                }
+            }
+            let selected = row
+                .selection
+                .map(|(s, e)| cell.x >= s && cell.x <= e)
+                .unwrap_or(false);
+            if selected {
+                fill_clipped(
+                    painter,
+                    clip,
+                    cx,
+                    y_top,
+                    cell_w,
+                    cell_h,
+                    theme.selection,
+                    0.32,
+                );
+            }
+        }
+        for cell in &row.cells {
+            if cell.len == 0 || cell.flags.invisible {
+                continue;
+            }
+            let mut text = String::with_capacity(cell.len as usize);
+            for cp in &cell.cps[..cell.len as usize] {
+                if let Some(ch) = char::from_u32(*cp) {
+                    text.push(ch);
+                }
+            }
+            let style = CellStyle {
+                fg: if cell.flags.faint {
+                    cell.fg.lerp(frame.background, 0.55)
+                } else {
+                    cell.fg
+                },
+                bold: cell.flags.bold,
+                italic: cell.flags.italic,
+                underline: cell.flags.underline,
+                strikethrough: cell.flags.strikethrough,
+                overline: cell.flags.overline,
+                underline_color: cell.underline,
+            };
+            let columns = unicode_width::UnicodeWidthStr::width(text.as_str()).max(1) as u16;
+            let extend = run
+                .as_ref()
+                .map(|r| r.end_x == cell.x && r.style == style)
+                .unwrap_or(false);
+            if extend {
+                if let Some(r) = &mut run {
+                    r.text.push_str(&text);
+                    r.end_x = cell.x + columns;
+                }
+            } else {
+                if let Some(r) = run.take() {
+                    draw_run_at(
+                        painter,
+                        &r,
+                        grid.x + r.x as f32 * cell_w,
+                        run_y,
+                        cell_w,
+                        cell_h,
+                        &clip,
+                    );
+                }
+                run = Some(Run {
+                    x: cell.x,
+                    end_x: cell.x + columns,
+                    text,
+                    style,
+                });
+            }
+        }
+        if let Some(r) = run.take() {
+            draw_run_at(
+                painter,
+                &r,
+                grid.x + r.x as f32 * cell_w,
+                run_y,
+                cell_w,
+                cell_h,
+                &clip,
+            );
+        }
+    }
+
+    // Cursor.
+    if let Some(cursor) = frame.cursor {
+        let show = if active {
+            mode != Mode::Compose && (!cursor.blinking || cursor_on)
+        } else {
+            true
+        };
+        if show {
+            let alpha = if active { 0.9 } else { 0.42 };
+            let cx = grid.x + cursor.x as f32 * cell_w;
+            let cy = grid.y + cursor.y as f32 * cell_h;
+            match cursor.style {
+                CursorStyle::Bar => fill_clipped(
+                    painter,
+                    clip,
+                    cx,
+                    cy,
+                    (cell_w * 0.12).max(2.0),
+                    cell_h,
+                    theme.cursor,
+                    alpha,
+                ),
+                CursorStyle::Block => {
+                    fill_clipped(painter, clip, cx, cy, cell_w, cell_h, theme.cursor, 0.45)
+                }
+                CursorStyle::Underline => fill_clipped(
+                    painter,
+                    clip,
+                    cx,
+                    cy + cell_h - scale_line(scale),
+                    cell_w,
+                    (2.0 * scale).max(1.5),
+                    theme.cursor,
+                    alpha,
+                ),
+                CursorStyle::HollowBlock => fill_clipped(
+                    painter,
+                    clip,
+                    cx + 1.0,
+                    cy + 1.0,
+                    cell_w - 2.0,
+                    cell_h - 2.0,
+                    theme.cursor,
+                    alpha,
+                ),
+            }
+        }
+    }
+
+    // Scrollbar.
+    let sb = frame.scrollbar;
+    if sb.total > sb.len && sb.len > 0 {
+        let track_x = grid.x + grid.w - (6.0 * scale);
+        let track_w = (3.0 * scale).max(2.0);
+        fill_clipped(
+            painter, clip, track_x, grid.y, track_w, grid.h, theme.dim, 0.12,
+        );
+        let frac = sb.offset as f32 / sb.total.max(1) as f32;
+        let thumb_h = (grid.h * (sb.len as f32 / sb.total as f32)).max(16.0 * scale);
+        let thumb_y = grid.y + frac * (grid.h - thumb_h);
+        fill_clipped(
+            painter, clip, track_x, thumb_y, track_w, thumb_h, theme.dim, 0.45,
+        );
+    }
+}
+
 #[derive(Clone, PartialEq)]
 struct CellStyle {
     fg: Rgb,
@@ -4664,6 +6709,88 @@ fn draw_run_at(
                 color,
                 0.8,
             );
+        }
+    }
+}
+
+fn current_row_in(session: &mut TerminalSession) -> u64 {
+    session.update_frame();
+    let offset = session.scrollbar().offset;
+    let y = session.frame().cursor.map(|c| c.y as u64).unwrap_or(0);
+    offset + y
+}
+
+fn note_output_start_in(blocks: &mut Vec<Block>, session: &mut TerminalSession, command: &str) {
+    if let Some(block) = blocks.last_mut() {
+        if block.end_row.is_none() {
+            if !command.is_empty() {
+                block.command = command.to_string();
+            }
+            return;
+        }
+    }
+    let row = current_row_in(session).saturating_sub(1);
+    blocks.push(Block {
+        command: command.to_string(),
+        start_row: row,
+        end_row: None,
+        status: None,
+    });
+    if blocks.len() > 200 {
+        blocks.remove(0);
+    }
+}
+
+/// Apply a shell integration event to an unfocused pane.
+fn apply_pane_event(state: &mut PaneState, event: TermEvent) {
+    match event {
+        TermEvent::PromptStart => {
+            state.got_prompt = true;
+            state.mode = Mode::Compose;
+            state.focus = Focus::Composer;
+            state.sel_anchor = None;
+            state.sel_drag = false;
+            state.history_index = None;
+            state.completion_popup = None;
+            state.editor.clear_selection();
+        }
+        TermEvent::InputStart => {}
+        TermEvent::OutputStart { command } => {
+            if state.mode == Mode::Compose {
+                state.mode = Mode::Running;
+            }
+            state.running_started = Instant::now();
+            if !command.is_empty() {
+                state.running_cmd = command.clone();
+            }
+            if let Some(session) = &mut state.session {
+                note_output_start_in(&mut state.blocks, session, &command);
+            }
+        }
+        TermEvent::CommandEnd { exit_code } => {
+            if let Some(code) = exit_code {
+                state.last_status = Some((code, Instant::now()));
+            }
+            if let Some(session) = &mut state.session {
+                close_open_block(&mut state.blocks, session, exit_code);
+            }
+        }
+        TermEvent::Bell => {}
+        TermEvent::TitleChanged => {
+            if let Some(session) = &state.session {
+                if let Some(title) = session.title() {
+                    state.title = title;
+                }
+            }
+        }
+        TermEvent::PwdChanged => {
+            if let Some(pwd) = state.session.as_ref().and_then(|session| session.pwd()) {
+                let path = pwd_to_path(&pwd);
+                if path.is_dir() {
+                    state.cwd = path;
+                    state.cwd_label.clear();
+                }
+            }
         }
     }
 }
@@ -4911,5 +7038,74 @@ impl ApplicationHandler<()> for PromptApp {
             self.toast = None;
             self.request_redraw();
         }
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    fn leaf(id: u64) -> PaneNode {
+        PaneNode::Leaf(id)
+    }
+
+    fn nested() -> PaneNode {
+        PaneNode::Split {
+            axis: SplitAxis::Vertical,
+            ratio: 0.5,
+            first: Box::new(leaf(0)),
+            second: Box::new(PaneNode::Split {
+                axis: SplitAxis::Horizontal,
+                ratio: 0.5,
+                first: Box::new(leaf(1)),
+                second: Box::new(leaf(2)),
+            }),
+        }
+    }
+
+    #[test]
+    fn split_inserts_second_leaf_and_removes_cleanly() {
+        let tree = split_leaf(leaf(0), 0, 1, SplitAxis::Vertical);
+        assert!(matches!(
+            tree,
+            PaneNode::Split {
+                axis: SplitAxis::Vertical,
+                ratio: 0.5,
+                ..
+            }
+        ));
+        let tree = remove_leaf(tree, 1).expect("remaining pane");
+        assert!(matches!(tree, PaneNode::Leaf(0)));
+        assert!(remove_leaf(tree, 0).is_none());
+    }
+
+    #[test]
+    fn root_and_nested_dividers_update_the_right_split() {
+        let mut tree = split_leaf(leaf(0), 0, 1, SplitAxis::Vertical);
+        assert!(set_split_ratio(&mut tree, &[], 0.7));
+        match &tree {
+            PaneNode::Split { ratio, .. } => assert!((*ratio - 0.7).abs() < 0.001),
+            _ => panic!("root should stay a split"),
+        }
+
+        let mut tree = nested();
+        assert!(set_split_ratio(&mut tree, &[true], 0.25));
+        let PaneNode::Split { ratio, second, .. } = &tree else {
+            panic!("root should stay a split");
+        };
+        assert!((*ratio - 0.5).abs() < 0.001, "parent ratio unchanged");
+        let PaneNode::Split { ratio, .. } = second.as_ref() else {
+            panic!("second child should stay a split");
+        };
+        assert!((*ratio - 0.25).abs() < 0.001);
+    }
+
+    #[test]
+    fn removing_a_nested_leaf_collapses_only_that_split() {
+        let tree = remove_leaf(nested(), 1).expect("remaining tree");
+        let PaneNode::Split { second, .. } = tree else {
+            panic!("root should stay a split");
+        };
+        assert!(matches!(second.as_ref(), PaneNode::Leaf(2)));
     }
 }
