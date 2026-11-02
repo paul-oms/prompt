@@ -15,16 +15,11 @@ to select, copy and paste with the shortcuts you already know, complete with syn
 highlighting, multiline commands, history search, background terminals, and tab completion.
 
 It's written in Rust and based on [libghostty](https://github.com/ghostty-org/ghostty). **Rendering is
-GPU-accelerated** with [wgpu](https://wgpu.rs): glyphs, colours, cursor and chrome paint directly on the GPU, and a
-software renderer takes over automatically when no usable adapter is present.
+GPU-accelerated** with [wgpu](https://wgpu.rs) and super fast.
 
 No configuration, no setup. It just works.
 
 ![Prompt demo: GPU-accelerated rendering with wgpu, showing a command, split panes, a background tab and block view](docs/demo.gif)
-
-*The demo is painted live by Prompt's GPU path: the composer docks to the bottom when the first command runs, the
-pane splits, a live command is parked in the background panel, then block view opens beside it. The title strip is
-part of the recording.*
 
 **Highlights**
 
