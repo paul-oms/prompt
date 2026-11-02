@@ -7,7 +7,7 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
-arboard = "3"
+arboard = { version = "3", features = ["wayland-data-control"] }
 bytemuck = { version = "1", features = ["derive"] }
 cosmic-text = "0.19"
 dirs = "7"
