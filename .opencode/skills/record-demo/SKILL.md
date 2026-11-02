@@ -9,13 +9,15 @@ description: Re-record docs/demo.gif for Prompt with the Neon Core particle tunn
 animation composited by hand. The flow is:
 
 1. The welcome composer is visible.
-2. Type `python3 ~/Source/prompt/scripts/neon.py` and run it.
-3. The composer docks; the particle tunnel fills the pane.
-4. Split right while the tunnel keeps running.
-5. Run `while true; do date +%T; sleep 1; done` in the new pane and move it to
+2. Type `run neon.py` and press `Ctrl+G`. The on-device Qwen model expands it to
+   `python /home/.../scripts/neon.py`.
+3. Review it, append ` --seconds 30`, then run it.
+4. The composer docks; the particle tunnel fills the pane.
+5. Split right while the tunnel keeps running.
+6. Run `while true; do date +%T; sleep 1; done` in the new pane and move it to
    the background panel.
-6. Focus the left pane and open block view.
-7. Encode the capture as a looping GIF.
+7. Focus the left pane and open block view.
+8. Encode the capture as a looping GIF.
 
 The title strip is part of the recording. It is a static 1080x34 image
 (`references/title.png`) laid over the top of the 1080x700 window capture.
@@ -37,8 +39,14 @@ DEMO_OUT=/tmp/demo.gif .opencode/skills/record-demo/scripts/record-demo.sh
 ```
 
 The recorder requires `Xvfb`, `xdotool`, `ffmpeg`, `python3`, and the release
-binary. It starts a private Xvfb at 1080x734, so the window lands at 0,0 with no
-window manager. If the display is already in use, pick another one.
+binary. It also needs the Qwen demo model: it reuses
+`target/demo-model.gguf` or the normal Prompt model cache, and downloads it to
+`target/demo-model.gguf` if neither exists. Override it with `DEMO_MODEL=...`.
+The recorder sets `PROMPT_CWD` to `scripts/`, so the generated
+`python .../neon.py` command resolves correctly while the shell still sees the
+normal home directory. It starts a private Xvfb at 1080x734, so the window lands
+at 0,0 with no window manager. If the display is already in use, pick another
+one.
 
 ## What the recorder does
 
@@ -70,6 +78,8 @@ HOME=$HOME \
 XDG_DATA_HOME=/tmp/prompt-demo-data \
 XDG_STATE_HOME=/tmp/prompt-demo-data/state \
 XDG_CACHE_HOME=/tmp/prompt-demo-data/cache \
+PROMPT_MODEL_PATH="$HOME/Source/prompt/target/demo-model.gguf" \
+PROMPT_CWD="$HOME/Source/prompt/scripts" \
 DISPLAY=:98 GDK_BACKEND=x11 PROMPT_RENDER=gpu \
   target/release/prompt
 ```
@@ -80,7 +90,7 @@ Find the window and capture it:
 wid=$(DISPLAY=:98 xdotool search --class '^prompt$' | head -1)
 DISPLAY=:98 xdotool windowfocus "$wid"
 ffmpeg -y -f x11grab -draw_mouse 0 -framerate 20 \
-  -video_size 1080x700 -i :98.0+0,0 -t 13 \
+  -video_size 1080x700 -i :98.0+0,0 -t 17 \
   -c:v libx264 -preset ultrafast -crf 10 /tmp/demo-raw.mp4
 ```
 
@@ -88,7 +98,12 @@ Drive the sequence (timings are in the recorder; keep the typing delays so the
 composer animation is visible):
 
 ```sh
-xdotool type --window "$wid" --delay 14 'python3 ~/Source/prompt/scripts/neon.py'
+xdotool type --window "$wid" --delay 14 'run neon.py'
+sleep 0.35
+xdotool key --window "$wid" ctrl+g
+sleep 3
+xdotool type --window "$wid" --delay 14 ' --seconds 30'
+sleep 0.35
 xdotool key --window "$wid" Return
 sleep 3
 xdotool key --window "$wid" ctrl+shift+d
@@ -120,8 +135,8 @@ ffmpeg -y -i /tmp/demo-titled.mp4 \
 
 - `ffprobe -v error -show_entries stream=width,height,nb_frames,r_frame_rate -of default=nw=1 docs/demo.gif`
   should report 900x612, 12fps, and a full frame count.
-- Check the first frame (welcome), the typing frame, the split transition, the
-  background panel, and the final block view.
+- Check the first frame (welcome), the AI-generated command and the edit, the
+  split transition, the background panel, and the final block view.
 - The tunnel status line should show about 60fps while it fills the pane.
 - Keep the GIF under roughly 3MB. If it grows, lower the width or frame rate
   before raising the colour count.

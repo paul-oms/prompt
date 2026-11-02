@@ -19,11 +19,12 @@ GPU-accelerated** with [wgpu](https://wgpu.rs) and super fast.
 
 No configuration, no setup. It just works.
 
-![Prompt demo: GPU-accelerated rendering with wgpu, showing a 3D particle tunnel, split panes, a background tab and block view](docs/demo.gif)
+![Prompt demo: on-device command generation, GPU-accelerated rendering with wgpu, a 3D particle tunnel, split panes, a background tab and block view](docs/demo.gif)
 
-*The demo is painted live by Prompt's GPU path: the composer docks to the bottom when the particle tunnel starts,
-the pane splits, a live command is parked in the background panel, then block view opens beside it. The animation is
-[`scripts/neon.py`](scripts/neon.py); the title strip is part of the recording.*
+*The demo is painted live by Prompt's GPU path: the on-device model turns “run neon.py” into a runnable command, the
+user reviews and edits it, then the particle tunnel fills the pane. The composer docks, the pane splits, a live command
+is parked in the background panel, and block view opens beside it. The animation is [`scripts/neon.py`](scripts/neon.py);
+the title strip is part of the recording.*
 
 **Highlights**
 

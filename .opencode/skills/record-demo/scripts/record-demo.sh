@@ -40,6 +40,40 @@ for tool in ffmpeg xdotool Xvfb python3; do
     fi
 done
 
+# The demo uses the real on-device model so the generation is genuine. Reuse a
+# cached copy when possible; otherwise fetch it once into target/.
+model=${DEMO_MODEL:-}
+if [ -z "$model" ]; then
+    for candidate in \
+        "$repo/target/demo-model.gguf" \
+        "$HOME/.local/share/prompt/models/qwen2.5-coder-0.5b-instruct-q4_k_m.gguf"; do
+        if [ -f "$candidate" ]; then
+            model=$candidate
+            break
+        fi
+    done
+fi
+if [ -z "$model" ]; then
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "missing required tool: curl (needed for the demo model)" >&2
+        exit 1
+    fi
+    model="$repo/target/demo-model.gguf"
+    mkdir -p "$(dirname "$model")"
+    echo "downloading the demo model to $model" >&2
+    curl -L --fail --retry 3 -o "$model" \
+        "https://huggingface.co/Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-0.5b-instruct-q4_k_m.gguf"
+fi
+if [ ! -f "$model" ]; then
+    echo "missing demo model: $model" >&2
+    exit 1
+fi
+# The app runs from scripts/ so the generated command is relative to it.
+model="$(cd "$(dirname "$model")" && pwd)/$(basename "$model")"
+export PROMPT_MODEL_PATH="$model"
+prompt=${DEMO_PROMPT:-"run neon.py"}
+edit=${DEMO_EDIT:-" --seconds 30"}
+
 if [ ! -x "$repo/target/release/prompt" ]; then
     echo "missing $repo/target/release/prompt; run: cargo build --release" >&2
     exit 1
@@ -69,6 +103,8 @@ export GDK_BACKEND=x11
 export PROMPT_RENDER=gpu
 unset WAYLAND_DISPLAY WAYLAND_SOCKET XDG_SESSION_TYPE GDK_SCALE GDK_DPI_SCALE QT_SCALE_FACTOR
 
+# Start the shell in scripts/ so "run neon.py" resolves to the demo script.
+export PROMPT_CWD="$repo/scripts"
 "$repo/target/release/prompt" >"$tmp/app.log" 2>&1 &
 app_pid=$!
 
@@ -95,18 +131,19 @@ xdotool windowfocus "$wid"
 sleep 0.8
 
 ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -framerate 20 \
-    -video_size 1080x700 -i "$display.0+0,0" -t 13 \
+    -video_size 1080x700 -i "$display.0+0,0" -t 17 \
     -c:v libx264 -preset ultrafast -crf 10 "$tmp/raw.mp4" &
 ff_pid=$!
 
-cmd="python3 $repo/scripts/neon.py"
-if [[ "$repo" == "$HOME/"* ]]; then
-    cmd="python3 ~/${repo#"$HOME"/}/scripts/neon.py"
-fi
-
 sleep 0.45
-xdotool type --window "$wid" --delay 14 "$cmd"
-sleep 0.3
+xdotool type --window "$wid" --delay 14 "$prompt"
+sleep 0.35
+# Ask the on-device model to turn the shorthand into a runnable command.
+xdotool key --window "$wid" ctrl+g
+sleep 3.0
+# Review the result and add a runtime limit before running it.
+xdotool type --window "$wid" --delay 14 "$edit"
+sleep 0.35
 xdotool key --window "$wid" Return
 sleep 3.0
 xdotool key --window "$wid" ctrl+shift+d

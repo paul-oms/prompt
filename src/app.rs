@@ -507,7 +507,13 @@ impl PromptApp {
             config.appearance.font_size,
             config.appearance.line_height,
         );
-        let cwd = shell::home_dir();
+        // A private hook for screenshots and the demo recorder: start the
+        // shell somewhere other than $HOME without changing the home the
+        // shell sees.
+        let cwd = std::env::var_os("PROMPT_CWD")
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir())
+            .unwrap_or_else(shell::home_dir);
         let started = Instant::now();
 
         let autotype = std::env::var("PROMPT_AUTOTYPE").ok().map(|text| {
