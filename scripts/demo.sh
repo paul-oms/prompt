@@ -23,46 +23,11 @@ done
 sleep 0.3
 clear
 
-# A truecolour animation: thousands of changing cells every frame. This is the
-# workload the GPU renderer is for.
-python3 - <<'PY'
-import math
-import shutil
-import sys
-import time
-
-cols, rows = shutil.get_terminal_size((128, 30))
-cols = max(20, cols)
-rows = max(8, rows - 1)
-out = sys.stdout
-out.write("\033[?25l\033[2J")
-start = time.monotonic()
-try:
-    while time.monotonic() - start < 6.5:
-        t = time.monotonic() - start
-        out.write("\033[H")
-        for row in range(rows):
-            y = row / rows
-            line = []
-            for col in range(cols):
-                x = col / cols
-                v = (math.sin(x * 9.0 + t * 2.0)
-                     + math.sin(y * 7.0 - t * 1.5)
-                     + math.sin((x + y) * 5.0 + t)) / 3.0
-                r = int(92 + 92 * math.cos(6.28318 * (v * 0.5)))
-                g = int(108 + 90 * math.cos(6.28318 * (v * 0.5 + 0.33)))
-                b = int(158 + 78 * math.cos(6.28318 * (v * 0.5 + 0.66)))
-                r = max(0, min(255, r))
-                g = max(0, min(255, g))
-                b = max(0, min(255, b))
-                line.append(f"\033[48;2;{r};{g};{b}m ")
-            out.write("".join(line) + "\033[0m\r\n")
-        out.flush()
-        time.sleep(0.05)
-finally:
-    out.write("\033[0m\033[?25h")
-    out.flush()
-PY
+# A truecolour animation: thousands of particles, a wireframe cube and a
+# plasma band, with every cell repainted each frame. This is the workload the
+# GPU renderer is for, and it is the same animation used in the README demo.
+script_dir=$(cd "$(dirname "$0")" && pwd)
+python3 "$script_dir/neon.py" --seconds 6.5
 
 clear
 printf '\n\n'
