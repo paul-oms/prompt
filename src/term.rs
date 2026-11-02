@@ -43,6 +43,10 @@ pub struct CellView {
     pub bg: Option<Rgb>,
     pub underline: Option<Rgb>,
     pub flags: CellFlags,
+    /// True for shell-prompt cells on the prompt the cursor is currently
+    /// sitting at. The UI hides these because the composer already shows the
+    /// live input line.
+    pub prompt: bool,
 }
 
 impl Default for CellView {
@@ -55,6 +59,7 @@ impl Default for CellView {
             bg: None,
             underline: None,
             flags: CellFlags::default(),
+            prompt: false,
         }
     }
 }
@@ -822,7 +827,91 @@ impl TerminalSession {
             self.frame.rows_view.truncate(row_index);
             self.frame.alt_screen = self.is_alt_screen();
             self.frame.scrollbar = self.scrollbar();
+            self.mark_live_prompt();
         }
+    }
+
+    /// Mark the prompt cells the cursor is currently sitting at. Only the live
+    /// prompt is marked so historical prompts stay visible in scrollback.
+    fn mark_live_prompt(&mut self) {
+        let Some((top, bottom)) = self.live_prompt_rows() else {
+            return;
+        };
+        let mut prompt_cells = Vec::new();
+        for y in top..=bottom {
+            let Some(row) = self.frame.rows_view.iter().find(|row| row.y == y) else {
+                continue;
+            };
+            for cell in &row.cells {
+                if unsafe { self.cell_is_prompt(cell.x, y) } {
+                    prompt_cells.push((y, cell.x));
+                }
+            }
+        }
+        for (y, x) in prompt_cells {
+            let Some(row) = self.frame.rows_view.iter_mut().find(|row| row.y == y) else {
+                continue;
+            };
+            if let Some(cell) = row.cells.iter_mut().find(|cell| cell.x == x) {
+                cell.prompt = true;
+            }
+        }
+    }
+
+    fn live_prompt_rows(&self) -> Option<(u16, u16)> {
+        if self.frame.alt_screen || !self.get(ffi::GHOSTTY_TERMINAL_DATA_CURSOR_AT_PROMPT, false) {
+            return None;
+        }
+        let cursor = self.frame.cursor?;
+        // Walk back to the primary row of the current prompt. Bash does not
+        // report output-start, so command output can also carry continuation
+        // semantics; stopping at the primary row keeps that output visible.
+        let mut y = cursor.y;
+        loop {
+            match unsafe { self.row_semantic_prompt(y) } {
+                ffi::GHOSTTY_ROW_SEMANTIC_PROMPT => return Some((y, cursor.y)),
+                ffi::GHOSTTY_ROW_SEMANTIC_NONE => return None,
+                _ if y == 0 => return None,
+                _ => y -= 1,
+            }
+        }
+    }
+
+    unsafe fn row_semantic_prompt(&self, y: u16) -> ffi::GhosttyRowSemanticPrompt {
+        let Some(reference) = self.grid_ref_viewport(0, y) else {
+            return ffi::GHOSTTY_ROW_SEMANTIC_NONE;
+        };
+        let mut row: ffi::GhosttyRow = 0;
+        if ffi::ghostty_grid_ref_row(&reference, &mut row) != ffi::GHOSTTY_SUCCESS {
+            return ffi::GHOSTTY_ROW_SEMANTIC_NONE;
+        }
+        let mut semantic: ffi::GhosttyRowSemanticPrompt = ffi::GHOSTTY_ROW_SEMANTIC_NONE;
+        if ffi::ghostty_row_get(
+            row,
+            ffi::GHOSTTY_ROW_DATA_SEMANTIC_PROMPT,
+            &mut semantic as *mut _ as *mut c_void,
+        ) != ffi::GHOSTTY_SUCCESS
+        {
+            return ffi::GHOSTTY_ROW_SEMANTIC_NONE;
+        }
+        semantic
+    }
+
+    unsafe fn cell_is_prompt(&self, x: u16, y: u16) -> bool {
+        let Some(reference) = self.grid_ref_viewport(x, y) else {
+            return false;
+        };
+        let mut cell: ffi::GhosttyCell = 0;
+        if ffi::ghostty_grid_ref_cell(&reference, &mut cell) != ffi::GHOSTTY_SUCCESS {
+            return false;
+        }
+        let mut semantic: ffi::GhosttyCellSemanticContent = ffi::GHOSTTY_CELL_SEMANTIC_OUTPUT;
+        ffi::ghostty_cell_get(
+            cell,
+            ffi::GHOSTTY_CELL_DATA_SEMANTIC_CONTENT,
+            &mut semantic as *mut _ as *mut c_void,
+        ) == ffi::GHOSTTY_SUCCESS
+            && semantic == ffi::GHOSTTY_CELL_SEMANTIC_PROMPT
     }
 
     pub fn frame(&self) -> &Frame {
@@ -1173,6 +1262,77 @@ mod tests {
         term.scroll_to_bottom();
         term.update_frame();
         assert!(term.scrollbar().at_bottom());
+    }
+
+    #[test]
+    fn marks_only_the_live_prompt_cells() {
+        let mut term = session();
+        // Bash only reports prompt-start and command-end, so everything after
+        // the prompt (including output) carries continuation semantics.
+        term.write(
+            b"\x1b]133;A\x1b\\old> \r\nline1\r\nline2\r\n\x1b]133;D;0\x1b\\\x1b]133;A\x1b\\new> ",
+        );
+        term.update_frame();
+
+        let current = term
+            .frame()
+            .rows_view
+            .iter()
+            .find(|row| row.y == 3)
+            .expect("current prompt row");
+        assert!(
+            current.cells.iter().any(|cell| cell.prompt),
+            "current prompt was not marked: {:?}",
+            current
+                .cells
+                .iter()
+                .map(|cell| cell.text())
+                .collect::<Vec<_>>()
+        );
+
+        for y in [1, 2] {
+            let output = term
+                .frame()
+                .rows_view
+                .iter()
+                .find(|row| row.y == y)
+                .expect("output row");
+            assert!(
+                !output.cells.iter().any(|cell| cell.prompt),
+                "command output should stay visible"
+            );
+        }
+
+        let old = term
+            .frame()
+            .rows_view
+            .iter()
+            .find(|row| row.y == 0)
+            .expect("old prompt row");
+        assert!(
+            !old.cells.iter().any(|cell| cell.prompt),
+            "historical prompt should stay visible"
+        );
+    }
+
+    #[test]
+    fn marks_multiline_prompt_rows() {
+        let mut term = session();
+        term.write(b"\x1b]133;A\x1b\\one\r\ntwo> ");
+        term.update_frame();
+
+        for y in [0, 1] {
+            let row = term
+                .frame()
+                .rows_view
+                .iter()
+                .find(|row| row.y == y)
+                .expect("prompt row");
+            assert!(
+                row.cells.iter().any(|cell| cell.prompt),
+                "prompt row {y} was not marked"
+            );
+        }
     }
 
     #[test]

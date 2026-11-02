@@ -6410,6 +6410,9 @@ fn paint_grid(
     outer_clip: Option<Clip>,
 ) {
     let frame = session.frame();
+    // The composer is the only input line while it owns the keyboard, so leave
+    // the shell's live prompt out of the grid instead of showing two cursors.
+    let hide_prompt = mode == Mode::Compose && !frame.alt_screen;
     let base_clip = Clip::new(grid.x, grid.y, grid.w, grid.h);
     let clip = outer_clip
         .map(|outer| base_clip.intersect(outer))
@@ -6517,6 +6520,9 @@ fn paint_grid(
         // Backgrounds and selection. Background first so selection stays
         // visible over coloured cells (warnings, diffs, etc.).
         for cell in &row.cells {
+            if hide_prompt && cell.prompt {
+                continue;
+            }
             let cx = grid.x + cell.x as f32 * cell_w;
             if let Some(bg) = cell.bg {
                 if bg != frame.background {
@@ -6541,7 +6547,7 @@ fn paint_grid(
             }
         }
         for cell in &row.cells {
-            if cell.len == 0 || cell.flags.invisible {
+            if cell.len == 0 || cell.flags.invisible || (hide_prompt && cell.prompt) {
                 continue;
             }
             let mut text = String::with_capacity(cell.len as usize);
