@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,6 +23,7 @@ use crate::gpu::{GlyphAtlas, Renderer};
 use crate::highlight;
 use crate::history::History;
 use crate::keys;
+use crate::model;
 use crate::pty::Pty;
 use crate::render::{Canvas, Painter};
 use crate::shell::{self, ShellKind, ShellLaunch};
@@ -270,6 +272,16 @@ struct Toast {
     until: Instant,
 }
 
+/// A command-generation request currently in flight. The id lets the UI ignore
+/// a result that arrives after the user cancelled or started another request.
+struct Generation {
+    id: u64,
+    started: Instant,
+    backend: &'static str,
+    status: String,
+    cancel: Arc<AtomicBool>,
+}
+
 /// One command's place in the terminal's scrollback. Rows are absolute, i.e.
 /// scrollback rows counted from the start of the session, so they stay valid
 /// while the viewport scrolls.
@@ -412,6 +424,9 @@ pub struct PromptApp {
     history: History,
     completion: CompletionEngine,
     clipboard: Option<Clipboard>,
+    model: model::Client,
+    generation: Option<Generation>,
+    next_generation: u64,
 
     mode: Mode,
     focus: Focus,
@@ -479,6 +494,13 @@ impl PromptApp {
         let theme = Theme::default();
         let launch = shell::prepare(&paths, &config);
         let history = History::load(paths.history_file(), 5000);
+        let model_notify_proxy = proxy.clone();
+        let model = model::Client::spawn(
+            paths.models_dir(),
+            Box::new(move || {
+                let _ = model_notify_proxy.send_event(());
+            }),
+        );
         let text = TextEngine::new(
             1.0,
             &config.appearance.font_family,
@@ -557,6 +579,9 @@ impl PromptApp {
             history,
             completion: CompletionEngine::new(),
             clipboard: None,
+            model,
+            generation: None,
+            next_generation: 1,
             mode: if launch_integrated {
                 Mode::Compose
             } else {
@@ -2749,6 +2774,11 @@ impl PromptApp {
         if let Some(toast) = &self.toast {
             next = next.min(toast.until);
         }
+        if self.generation.is_some() {
+            // Keep the elapsed time and download percentage moving.
+            self.request_redraw();
+            next = next.min(now + Duration::from_millis(100));
+        }
         if self.dock_started.is_some() {
             self.request_redraw();
             next = next.min(now + Duration::from_millis(16));
@@ -3048,8 +3078,24 @@ impl PromptApp {
             return true;
         }
 
+        // Cmd/Ctrl+G asks the on-device model for a command instead of running
+        // what is currently in the composer. Cmd/Ctrl+Enter is an alias, but a
+        // letter chord is the headline shortcut because some input stacks
+        // deliver Ctrl+Enter as a plain Enter.
+        if primary
+            && !shift
+            && (code == KeyCode::KeyG || matches!(code, KeyCode::Enter | KeyCode::NumpadEnter))
+        {
+            self.generate_command();
+            return true;
+        }
+
         // Enter is special: submit, or newline with Shift.
         if code == KeyCode::Enter || code == KeyCode::NumpadEnter {
+            if self.generation.is_some() {
+                self.toast("Still generating — esc to cancel");
+                return true;
+            }
             if self.completion_popup.is_some() {
                 self.accept_completion();
                 return true;
@@ -3065,6 +3111,10 @@ impl PromptApp {
         }
 
         if code == KeyCode::Escape {
+            if self.generation.is_some() {
+                self.cancel_generation();
+                return true;
+            }
             if self.search.is_some() {
                 self.search = None;
             } else if self.completion_popup.is_some() {
@@ -3216,7 +3266,9 @@ impl PromptApp {
         if ctrl {
             match code {
                 KeyCode::KeyC => {
-                    if self.editor.has_selection() {
+                    if self.generation.is_some() {
+                        self.cancel_generation();
+                    } else if self.editor.has_selection() {
                         self.copy_selection();
                     } else {
                         self.editor.clear();
@@ -3344,9 +3396,113 @@ impl PromptApp {
         self.write_pty(bytes);
     }
 
+    // ---- model-assisted command generation --------------------------------
+
+    /// Turn the composer text into a request and let the background model
+    /// worker fill the composer with a command. Never runs anything.
+    fn generate_command(&mut self) {
+        if self.generation.is_some() {
+            self.toast("Still generating — esc to cancel");
+            return;
+        }
+        if self.mode != Mode::Compose || self.block_view.is_some() {
+            return;
+        }
+
+        let intent = self.editor.text().trim().to_string();
+        if intent.is_empty() {
+            self.toast("Type what you want to do first");
+            return;
+        }
+
+        let id = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let backend = self.model.backend();
+        let cwd = if self.cwd.as_os_str().is_empty() {
+            ".".to_string()
+        } else {
+            self.cwd.display().to_string()
+        };
+
+        self.model.request(model::Request {
+            id,
+            intent,
+            shell: self.launch.kind.name().to_string(),
+            cwd,
+            cancel: cancel.clone(),
+        });
+        self.generation = Some(Generation {
+            id,
+            started: Instant::now(),
+            backend,
+            status: "Preparing command model…".into(),
+            cancel,
+        });
+        self.focus = Focus::Composer;
+        self.cursor_on = true;
+        self.request_redraw();
+    }
+
+    fn cancel_generation(&mut self) {
+        if let Some(generation) = self.generation.take() {
+            generation.cancel.store(true, Ordering::Relaxed);
+            self.toast("Generation cancelled");
+        }
+        self.request_redraw();
+    }
+
+    fn poll_model(&mut self) {
+        while let Some(event) = self.model.try_recv() {
+            match event {
+                model::Event::Status { id, text } => {
+                    if let Some(generation) = &mut self.generation {
+                        if generation.id == id {
+                            generation.status = text;
+                            self.request_redraw();
+                        }
+                    }
+                }
+                model::Event::Done {
+                    id,
+                    result,
+                    elapsed,
+                    backend,
+                } => {
+                    let current = self.generation.as_ref().map(|g| g.id);
+                    if current != Some(id) {
+                        continue;
+                    }
+                    self.generation = None;
+                    match result {
+                        Ok(command) => {
+                            self.editor.set_text(&command);
+                            self.history_index = None;
+                            self.completion_popup = None;
+                            self.focus = Focus::Composer;
+                            self.after_edit();
+                            self.toast(format!(
+                                "{backend} · {:.1}s — enter to run, esc to clear",
+                                elapsed.as_secs_f32()
+                            ));
+                        }
+                        Err(err) => {
+                            self.toast(format!("{backend}: {err}"));
+                            self.request_redraw();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // ---- submitting -------------------------------------------------------
 
     fn submit(&mut self) {
+        if self.generation.is_some() {
+            self.toast("Still generating — esc to cancel");
+            return;
+        }
         self.begin_dock();
         if self.block_view.is_some() {
             self.close_block_view();
@@ -5090,6 +5246,13 @@ impl PromptApp {
                 status = format!("exit {code}   {status}");
             }
         }
+        if let Some(generation) = &self.generation {
+            status = format!(
+                "{} · {:.1}s",
+                generation.backend,
+                generation.started.elapsed().as_secs_f32()
+            );
+        }
         let status_w = self.text.measure_text(&status, false);
         let suggestion = if mode == Mode::Compose && !block_view {
             self.inline_suggestion()
@@ -5178,7 +5341,13 @@ impl PromptApp {
                 ("◆", theme.accent)
             } else {
                 match mode {
-                    Mode::Compose => ("❯", theme.accent),
+                    Mode::Compose => {
+                        if self.generation.is_some() {
+                            ("◐", theme.accent)
+                        } else {
+                            ("❯", theme.accent)
+                        }
+                    }
                     Mode::Running => ("●", theme.yellow),
                     Mode::Direct => ("!", theme.red),
                 }
@@ -5295,36 +5464,48 @@ impl PromptApp {
             return;
         }
         let hint_clip = Clip::new(card_x + pad, hint_y, card_w - pad * 2.0, hint_h);
-        let long_hint = if block_view {
-            "esc exit   [ ] blocks   g/G top/bottom   e expand   / search   ↑↓ scroll"
+        let long_hint: String = if block_view {
+            "esc exit   [ ] blocks   g/G top/bottom   e expand   / search   ↑↓ scroll".into()
+        } else if let Some(generation) = &self.generation {
+            format!("{}   ·   esc cancel", generation.status)
         } else {
             match mode {
                 Mode::Compose => {
                     if keys::is_macos() {
-                        "enter run   shift+enter newline   ↑↓ history   ⌘R search   ⌘V paste"
+                        "enter run   ⌘G generate   shift+enter newline   ↑↓ history   ⌘R search"
                     } else {
-                        "enter run   shift+enter newline   ↑↓ history   ^R search   ^V paste"
+                        "enter run   ctrl+g generate   shift+enter newline   ↑↓ history   ^R search"
                     }
                 }
                 Mode::Running => "running — ctrl-c to interrupt   ctrl-shift-m background",
                 Mode::Direct => "this shell has no prompt integration; use zsh or bash",
             }
+            .into()
         };
-        let short_hint = if block_view {
-            "esc exit   / search   e expand"
+        let short_hint: String = if block_view {
+            "esc exit   / search   e expand".into()
+        } else if self.generation.is_some() {
+            "generating… esc cancel".into()
         } else {
             match mode {
-                Mode::Compose => "enter run   ↑ history   tab autocomplete",
+                Mode::Compose => {
+                    if keys::is_macos() {
+                        "enter run   ⌘G generate   tab autocomplete"
+                    } else {
+                        "enter run   ctrl+g generate   tab autocomplete"
+                    }
+                }
                 Mode::Running => "running — ctrl-c stops   ctrl-shift-m background",
                 Mode::Direct => "classic input — zsh/bash enable the composer",
             }
+            .into()
         };
         let hint_text_y = hint_y + (hint_h - cell_h) / 2.0 + s(1.0);
         let status_x = card_x + card_w - pad - status_w;
-        let mut hint = long_hint;
+        let mut hint = long_hint.as_str();
         let mut hint_w = painter.text.measure_text(hint, false);
         if card_x + pad + hint_w + s(14.0) >= status_x {
-            hint = short_hint;
+            hint = short_hint.as_str();
             hint_w = painter.text.measure_text(hint, false);
         }
         painter.text(
@@ -7003,6 +7184,7 @@ impl ApplicationHandler<()> for PromptApp {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
         self.drain_pty();
+        self.poll_model();
     }
 
     fn window_event(
@@ -7020,6 +7202,7 @@ impl ApplicationHandler<()> for PromptApp {
             }
             WindowEvent::RedrawRequested => {
                 self.drain_pty();
+                self.poll_model();
                 self.render();
             }
             WindowEvent::ScaleFactorChanged { .. } => {
@@ -7096,6 +7279,7 @@ impl ApplicationHandler<()> for PromptApp {
             return;
         }
         self.drain_pty();
+        self.poll_model();
         self.check_exit(event_loop);
         self.update_timers(event_loop);
         if self

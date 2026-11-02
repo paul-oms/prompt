@@ -18,6 +18,15 @@ components; Prompt's own code is MIT (see `LICENSE`).
 | [unicode-width](https://github.com/unicode-rs/unicode-width) | Display width | Apache-2.0 / MIT |
 | [serde](https://serde.rs) / [toml](https://github.com/toml-rs/toml) | Config and history | Apache-2.0 / MIT |
 | [dirs](https://github.com/dirs-dev/dirs-rs) | Platform directories | Apache-2.0 / MIT |
+| [llama.cpp](https://github.com/ggml-org/llama.cpp) | Local Qwen inference (Linux and macOS 26) | MIT |
+| [Qwen2.5-Coder](https://huggingface.co/Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF) | Downloaded on-device command model | Apache-2.0 |
+| [ureq](https://github.com/algesten/ureq) | One-time model download | Apache-2.0 / MIT |
+| [sha2](https://github.com/RustCrypto/hashes) | Model checksum verification | Apache-2.0 / MIT |
+
+The Qwen model is not part of the repository or the release archive. Prompt
+downloads it from Hugging Face on first use and verifies the pinned SHA-256.
+The model's Apache-2.0 licence and the llama.cpp MIT licence apply to those
+components.
 
 If a zsh binary is bundled with a release via `scripts/vendor-zsh.sh`, that
 binary remains under zsh's own licence (MIT-like, see the zsh distribution).

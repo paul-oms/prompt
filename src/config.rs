@@ -135,6 +135,12 @@ impl Paths {
         self.data_dir.join("history.jsonl")
     }
 
+    /// On-device models are cached here. They are downloaded on first use, so
+    /// this directory may be empty.
+    pub fn models_dir(&self) -> PathBuf {
+        self.data_dir.join("models")
+    }
+
     pub fn state_file(&self) -> PathBuf {
         self.data_dir.join("state.toml")
     }

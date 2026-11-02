@@ -213,11 +213,18 @@ fail”, “make a branch for this ticket”.
 command in under 15 seconds.
 
 ### AGENT-13 · Apple Foundation Models command generation
-**Value 5 · Effort M · Confidence M**
+**Value 5 · Effort M · Confidence M · Status: implemented**
 
 macOS 26 ships the Foundation Models framework: a small on-device model with
 guided generation, no API key and no network. Make it the zero-setup default for
 command generation on supported Macs.
+
+Implemented with a shared `CommandModel` path: macOS 27 uses the Swift
+Foundation Models bridge, while Linux and macOS 26 run a downloaded
+Qwen2.5-Coder 0.5B Q4 model through llama.cpp. `Cmd/Ctrl+G` (or
+`Cmd/Ctrl+Enter`) replaces the composer text with a generated command for
+review; up to 30 lines; no auto-run. The model is fetched once and verified by
+SHA-256.
 
 - Add a small Swift helper exposed to Rust through a C ABI, with
   `generate command`, `explain` and `suggest fix` entry points; keep
@@ -471,7 +478,7 @@ help without joining a Discord.
 | 1 | CORE-16 | Split panes | Shipped | 5 | L | M | Agents need a visible shell beside them |
 | 2 | SHELL-05 | Integration diagnostics | Not started | 5 | S | H | Zero-config trust |
 | 3 | AGENT-03 | NL → command preview | Not started | 5 | L | M | Signature feature |
-| 4 | AGENT-13 | Apple Foundation Models | New | 5 | M | M | Private, zero-setup AI on macOS 26+ |
+| 4 | AGENT-13 | Apple Foundation Models | Implemented | 5 | M | M | Private, zero-setup AI on macOS 27+ and Linux |
 | 5 | AGENT-01 | Agent detection/status | Not started | 5 | M | M | Core differentiation |
 | 6 | DISC-01 | Block actions | Blocks shipped | 5 | M | H | Finish the discovery foundation |
 | 7 | EDIT-02 | Completion v2 | Partial | 4 | M | M | Reduces typing and errors |

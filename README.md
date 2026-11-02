@@ -29,6 +29,7 @@ the pane splits, a live command is parked in the background panel, then block vi
 
 - **GPU rendering** — instanced glyphs and rectangles in one wgpu pass, with automatic CPU fallback.
 - **Editor-grade composer** — click-to-edit, multiline commands, history search and tab completion.
+- **On-device command generation** — describe what you want, review the generated command, then run it. No API key, no network after the first download.
 - **Splits and background tabs** — run an agent and a shell side by side, or park long-running work.
 
 ## Download
@@ -44,9 +45,11 @@ launch, right-click **Prompt.app**, choose **Open**, then confirm.
 
 ## Install / run
 
-Requirements: Rust (stable), and on Linux a windowing system (X11 or Wayland).
-The vendored libghostty-vt bindings are generated C headers, so a C compiler or
-libclang is only needed if you rebuild the VT library or regenerate bindings.
+Requirements: Rust (stable), a C/C++ compiler and CMake (llama.cpp is built as
+part of the local model), and on Linux a windowing system (X11 or Wayland).
+Prebuilt release binaries need none of this. The vendored libghostty-vt bindings
+are generated C headers, so a C compiler or libclang is only needed if you
+rebuild the VT library or regenerate bindings.
 
 ```sh
 cargo run --release
@@ -58,6 +61,7 @@ The first launch creates:
 ~/.config/prompt/config.toml          # optional settings
 ~/.config/prompt/shell/                # zsh/bash integration + shims
 ~/.local/share/prompt/history.jsonl    # command history
+~/.local/share/prompt/models/          # downloaded on first command generation
 ```
 
 No shell setup is required. Prompt prefers, in order:
@@ -111,6 +115,7 @@ Prompt is designed for both macOS and Linux. `Cmd` means `Cmd` on macOS and
 | Action | macOS | Linux |
 | --- | --- | --- |
 | Run command | `Enter` | `Enter` |
+| Generate a command (don't run) | `Cmd+G` (or `Cmd+Enter`) | `Ctrl+G` (or `Ctrl+Enter`) |
 | New line | `Shift+Enter` | `Shift+Enter` |
 | Previous / next history or completion | `Up` / `Down` | `Up` / `Down` |
 | Search history | `Cmd+R` | `Ctrl+R` |
@@ -155,6 +160,30 @@ block view) to browse blocks.
 In block view: `[`/`]` moves between blocks, `g`/`G` snaps to the top or
 bottom, `e` expands a long block, `/` searches inside it, `n`/`N` walks the
 matches, and `Esc` returns to the terminal.
+
+## On-device commands
+
+Type what you want in the composer and press `Cmd+G` (macOS) or `Ctrl+G`
+(Linux); `Cmd/Ctrl+Enter` also works. Prompt turns the sentence into a shell
+command and puts it back in the composer. Nothing runs automatically: edit the command if you
+like, then press `Enter` to run it or `Esc` to clear it. Press `Esc` while a
+command is being generated to cancel.
+
+Generated commands can be up to 30 lines. The shortcut reuses the same
+on-device backends as the rest of Prompt:
+
+- **macOS 27+ with Apple Intelligence** uses Apple's Foundation Models
+  framework. There is no download, no API key and no network call. If Apple
+  Intelligence is unavailable at runtime, Prompt falls back to Qwen.
+- **Linux and macOS 26** use a small Qwen2.5-Coder 0.5B model, quantised to
+  Q4. Prompt downloads it once, on first use (~470 MB), into
+  `~/.local/share/prompt/models/`, verifies its SHA-256 and then runs it
+  locally with llama.cpp. Later generations work offline.
+
+The model sees the request, the shell, the platform and the current
+directory. It does not see command output, environment variables or your
+history. Override the local model with `PROMPT_MODEL_PATH=/path/to/model.gguf`
+or the download URL with `PROMPT_MODEL_URL=...`.
 
 ## Configuration
 

@@ -1,4 +1,5 @@
 mod app;
+mod apple_fm;
 mod completion;
 mod config;
 mod editor;
@@ -8,6 +9,7 @@ mod gpu;
 mod highlight;
 mod history;
 mod keys;
+mod model;
 mod pty;
 mod render;
 mod shell;
