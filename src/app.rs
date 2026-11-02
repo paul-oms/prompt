@@ -4229,12 +4229,24 @@ impl PromptApp {
         })
     }
 
+    fn grid_content_pad(&self) -> f32 {
+        if self.block_view.is_some() {
+            return 0.0;
+        }
+        let Some(session) = &self.session else {
+            return 0.0;
+        };
+        let hide_prompt = self.mode == Mode::Compose && !session.frame().alt_screen;
+        grid_content_offset(session, hide_prompt, self.text.cell_h)
+    }
+
     fn viewport_cell(&self, x: f32, y: f32) -> Option<(u16, u16)> {
         if !self.mouse_in_grid(x, y) {
             return None;
         }
+        let pad = self.grid_content_pad();
         let cx = ((x - self.grid.x) / self.text.cell_w).floor() as i32;
-        let cy = ((y - self.grid.y) / self.text.cell_h).floor() as i32;
+        let cy = ((y - self.grid.y - pad) / self.text.cell_h).floor() as i32;
         if cx < 0 || cy < 0 || cx >= self.grid.cols as i32 || cy >= self.grid.rows as i32 {
             return None;
         }
@@ -4528,6 +4540,7 @@ impl PromptApp {
                 cursor_on,
                 true,
                 clip,
+                self.block_view.is_none(),
             );
         }
 
@@ -4550,6 +4563,7 @@ impl PromptApp {
                 cursor_on,
                 false,
                 Some(slot.anim.clip()),
+                state.block_view.is_none(),
             );
         }
 
@@ -4568,6 +4582,7 @@ impl PromptApp {
                 cursor_on,
                 false,
                 Some(pane.anim.clip()),
+                pane.state.block_view.is_none(),
             );
         }
 
@@ -6397,6 +6412,18 @@ fn draw_dividers(
     }
 }
 
+/// Empty space above the terminal content when a block is shorter than the
+/// grid. Anchoring blocks to the bottom keeps the newest output next to the
+/// composer.
+fn grid_content_offset(session: &TerminalSession, ignore_prompt: bool, cell_h: f32) -> f32 {
+    let frame = session.frame();
+    if frame.alt_screen {
+        return 0.0;
+    }
+    let used = session.content_rows(ignore_prompt);
+    frame.rows.saturating_sub(used) as f32 * cell_h
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_grid(
     painter: &mut Painter,
@@ -6408,11 +6435,18 @@ fn paint_grid(
     cursor_on: bool,
     active: bool,
     outer_clip: Option<Clip>,
+    align_bottom: bool,
 ) {
     let frame = session.frame();
+    let cell_h = painter.text.cell_h;
     // The composer is the only input line while it owns the keyboard, so leave
     // the shell's live prompt out of the grid instead of showing two cursors.
     let hide_prompt = mode == Mode::Compose && !frame.alt_screen;
+    let content_offset = if align_bottom {
+        grid_content_offset(session, hide_prompt, cell_h)
+    } else {
+        0.0
+    };
     let base_clip = Clip::new(grid.x, grid.y, grid.w, grid.h);
     let clip = outer_clip
         .map(|outer| base_clip.intersect(outer))
@@ -6421,7 +6455,6 @@ fn paint_grid(
         return;
     }
     let cell_w = painter.text.cell_w;
-    let cell_h = painter.text.cell_h;
     let scale = painter.scale;
 
     fill_clipped(
@@ -6480,7 +6513,7 @@ fn paint_grid(
                 Some(_) => theme.red,
             };
             if visible.contains(&header) {
-                let y = grid.y + (header - offset) as f32 * cell_h;
+                let y = grid.y + content_offset + (header - offset) as f32 * cell_h;
                 fill_clipped(painter, clip, grid.x, y, grid.w, cell_h, theme.accent, 0.06);
                 fill_clipped(
                     painter,
@@ -6496,7 +6529,8 @@ fn paint_grid(
             let first = header.max(offset);
             let last = end.min(visible.end.saturating_sub(1));
             if last >= first {
-                let top = grid.y + (first - offset) as f32 * cell_h + cell_h * 0.15;
+                let top =
+                    grid.y + content_offset + (first - offset) as f32 * cell_h + cell_h * 0.15;
                 let height = (last - first + 1) as f32 * cell_h - cell_h * 0.3;
                 fill_clipped(
                     painter,
@@ -6515,7 +6549,7 @@ fn paint_grid(
     let mut run: Option<Run> = None;
     let mut run_y;
     for row in &frame.rows_view {
-        let y_top = grid.y + row.y as f32 * cell_h;
+        let y_top = grid.y + content_offset + row.y as f32 * cell_h;
         run_y = y_top;
         // Backgrounds and selection. Background first so selection stays
         // visible over coloured cells (warnings, diffs, etc.).
@@ -6622,7 +6656,7 @@ fn paint_grid(
         if show {
             let alpha = if active { 0.9 } else { 0.42 };
             let cx = grid.x + cursor.x as f32 * cell_w;
-            let cy = grid.y + cursor.y as f32 * cell_h;
+            let cy = grid.y + content_offset + cursor.y as f32 * cell_h;
             match cursor.style {
                 CursorStyle::Bar => fill_clipped(
                     painter,

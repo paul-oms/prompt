@@ -1077,6 +1077,25 @@ impl TerminalSession {
         String::new()
     }
 
+    /// Number of viewport rows up to the last row with visible content. Used
+    /// to keep short output anchored above the composer instead of at the top
+    /// of an otherwise empty grid.
+    pub fn content_rows(&self, ignore_prompt: bool) -> u16 {
+        let background = self.frame.background;
+        for row in self.frame.rows_view.iter().rev() {
+            let has_content = row.cells.iter().any(|cell| {
+                if ignore_prompt && cell.prompt {
+                    return false;
+                }
+                cell.len > 0 || cell.bg.is_some_and(|bg| bg != background)
+            });
+            if has_content {
+                return row.y.saturating_add(1);
+            }
+        }
+        0
+    }
+
     /// Like `last_line`, but ignores the cursor row so a finished command shows
     /// its last output instead of the shell prompt printed below it.
     pub fn last_line_before_cursor(&self) -> String {
@@ -1333,6 +1352,17 @@ mod tests {
                 "prompt row {y} was not marked"
             );
         }
+    }
+
+    #[test]
+    fn content_rows_can_ignore_the_live_prompt() {
+        let mut term = session();
+        term.write(
+            b"\x1b]133;A\x1b\\prompt> \x1b]133;C\x1b\\echo hi\r\nhi\r\n\x1b]133;D;0\x1b\\\x1b]133;A\x1b\\prompt> ",
+        );
+        term.update_frame();
+        assert_eq!(term.content_rows(false), 3);
+        assert_eq!(term.content_rows(true), 2);
     }
 
     #[test]
