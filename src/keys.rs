@@ -131,12 +131,23 @@ pub fn ghostty_mods(mods: winit::keyboard::ModifiersState) -> ffi::GhosttyMods {
 }
 
 /// Encode a key press for a program running in the terminal.
+///
+/// `unshifted` is the layout's codepoint for the physical key before any
+/// modifiers. Ghostty needs it to distinguish chords from text when the
+/// program enables Kitty's keyboard protocol.
 pub fn encode(
     term: &mut TerminalSession,
     code: KeyCode,
     mods: winit::keyboard::ModifiersState,
     text: Option<&str>,
+    unshifted: Option<char>,
 ) -> Vec<u8> {
     let key = ghostty_key(code).unwrap_or(ffi::GHOSTTY_KEY_UNIDENTIFIED);
-    term.encode_key(key, ghostty_mods(mods), ffi::GHOSTTY_KEY_ACTION_PRESS, text)
+    term.encode_key(
+        key,
+        ghostty_mods(mods),
+        ffi::GHOSTTY_KEY_ACTION_PRESS,
+        text,
+        unshifted,
+    )
 }

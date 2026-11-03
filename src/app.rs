@@ -12,7 +12,8 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
-use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, PhysicalKey};
+use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{Window, WindowId};
 
 use crate::completion::{common_prefix, history_suggestion, CompletionEngine, CompletionSet};
@@ -219,6 +220,7 @@ impl PaneSlot {
 /// A pane that is animating out after being closed. Its shell is still alive
 /// for the duration of the animation.
 struct ClosingPane {
+    id: u64,
     state: PaneState,
     layout: PaneLayout,
     anim: Rect,
@@ -287,11 +289,75 @@ struct Generation {
 /// while the viewport scrolls.
 struct Block {
     command: String,
-    /// First output row of the command.
+    /// The row the command was entered on.
     start_row: u64,
+    /// First row printed after the command line. Captured from the shell's
+    /// output-start marker, so copying output never has to guess row offsets.
+    output_start: Option<u64>,
     /// Last output row, once the command has finished.
     end_row: Option<u64>,
     status: Option<i32>,
+    /// Directory the command ran in.
+    cwd: PathBuf,
+    /// When the command was submitted.
+    started: Instant,
+    /// How long the command ran, once it has finished.
+    duration: Option<Duration>,
+    /// Long output can be folded in the normal grid. The command line, a few
+    /// leading lines and the tail stay visible; the middle becomes one
+    /// "N lines hidden" row.
+    collapsed: bool,
+}
+
+impl Block {
+    fn new(command: String, start_row: u64, cwd: PathBuf) -> Self {
+        Self {
+            command,
+            start_row,
+            output_start: None,
+            end_row: None,
+            status: None,
+            cwd,
+            started: Instant::now(),
+            duration: None,
+            collapsed: false,
+        }
+    }
+
+    /// Inclusive row span of the command's output, excluding the command line
+    /// itself. Returns `None` while no output has arrived.
+    fn output_range(&self) -> Option<(u64, u64)> {
+        let end = self.end_row?;
+        let start = self
+            .output_start
+            .unwrap_or(self.start_row.saturating_add(1));
+        (start <= end).then_some((start, end))
+    }
+
+    /// Range hidden by the normal-grid collapse, if the block is folded. Keep
+    /// the command row, a little context after it and the tail of the output.
+    #[cfg(test)]
+    fn hidden_range(&self) -> Option<(u64, u64)> {
+        self.hidden_range_with_tail(BLOCK_COLLAPSE_TAIL)
+    }
+
+    fn hidden_range_with_tail(&self, tail: u64) -> Option<(u64, u64)> {
+        if !self.collapsed {
+            return None;
+        }
+        let end = self.end_row?;
+        if self.line_count()? <= BLOCK_WINDOW {
+            return None;
+        }
+        let start = self.start_row.saturating_add(BLOCK_COLLAPSE_HEAD);
+        let end = end.saturating_sub(tail);
+        (start <= end).then_some((start, end))
+    }
+
+    fn line_count(&self) -> Option<u64> {
+        self.end_row
+            .map(|end| end.saturating_sub(self.start_row) + 1)
+    }
 }
 
 /// A detached tab: its shell (and any running command) keeps living while the
@@ -349,6 +415,36 @@ impl PanelMetrics {
 
 /// Rows in a block longer than this start collapsed to a 300-line window.
 const BLOCK_WINDOW: u64 = 300;
+/// Rows kept above the folded middle: the command row plus a little context.
+const BLOCK_COLLAPSE_HEAD: u64 = 6;
+/// Newest output rows kept visible below a folded middle.
+const BLOCK_COLLAPSE_TAIL: u64 = 24;
+
+/// Actions offered for the block currently open in block view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockAction {
+    CopyCommand,
+    CopyOutput,
+    SelectOutput,
+    Rerun,
+    Edit,
+    ToggleCollapse,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BlockActionHit {
+    rect: Rect,
+    action: BlockAction,
+}
+
+/// One painted row of the active grid. Hidden block ranges collapse into a
+/// single marker row so long output stays out of the way without changing the
+/// terminal's real scrollback coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GridSlot {
+    Row(u64),
+    Hidden { block: usize, lines: u64 },
+}
 
 #[derive(Clone, Copy, Debug)]
 struct BlockMatch {
@@ -419,6 +515,9 @@ pub struct PromptApp {
     panel_scroll: f32,
     detach_rect: Option<(f32, f32, f32, f32)>,
     block_view: Option<BlockView>,
+    /// Clickable actions painted into the block-view bar.
+    block_actions: Vec<BlockActionHit>,
+    hover_block_action: Option<BlockAction>,
     pending_highlight: Option<(u64, u16, u16)>,
     editor: Editor,
     history: History,
@@ -580,6 +679,8 @@ impl PromptApp {
             panel_scroll: 0.0,
             detach_rect: None,
             block_view: None,
+            block_actions: Vec::new(),
+            hover_block_action: None,
             pending_highlight: None,
             editor: Editor::default(),
             history,
@@ -1486,6 +1587,7 @@ impl PromptApp {
         self.panes.remove(index);
         if let Some(state) = state {
             self.closing_panes.push(ClosingPane {
+                id,
                 state,
                 layout,
                 anim,
@@ -1954,12 +2056,7 @@ impl PromptApp {
         } else {
             command
         };
-        self.blocks.push(Block {
-            command,
-            start_row: row,
-            end_row: None,
-            status: None,
-        });
+        self.blocks.push(Block::new(command, row, self.cwd.clone()));
         // Keep the chrome bounded for very long sessions.
         if self.blocks.len() > 200 {
             self.blocks.remove(0);
@@ -1971,24 +2068,24 @@ impl PromptApp {
     /// the composer already have a block (created at submit time); this also
     /// covers commands started by other means, e.g. typed in classic input.
     fn note_output_start(&mut self, command: String) {
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let row = Self::current_row(session);
         if let Some(block) = self.blocks.last_mut() {
             if block.end_row.is_none() {
                 if !command.is_empty() {
                     block.command = command;
                 }
+                if block.output_start.is_none() {
+                    block.output_start = Some(row);
+                }
                 return;
             }
         }
-        let Some(session) = &mut self.session else {
-            return;
-        };
-        let row = Self::current_row(session).saturating_sub(1);
-        self.blocks.push(Block {
-            command,
-            start_row: row,
-            end_row: None,
-            status: None,
-        });
+        let mut block = Block::new(command, row.saturating_sub(1), self.cwd.clone());
+        block.output_start = Some(row);
+        self.blocks.push(block);
         if self.blocks.len() > 200 {
             self.blocks.remove(0);
         }
@@ -2074,6 +2171,15 @@ impl PromptApp {
     }
 
     fn open_block_view(&mut self, index: Option<usize>) {
+        if self
+            .session
+            .as_ref()
+            .map(|session| session.frame().alt_screen)
+            .unwrap_or(false)
+        {
+            self.toast("Block view is unavailable while a full-screen program runs");
+            return;
+        }
         if self.blocks.is_empty() {
             self.toast("No command blocks yet");
             return;
@@ -2104,6 +2210,8 @@ impl PromptApp {
         if self.block_view.take().is_none() {
             return;
         }
+        self.block_actions.clear();
+        self.hover_block_action = None;
         self.pending_highlight = None;
         if let Some(session) = &mut self.session {
             session.clear_selection();
@@ -2200,6 +2308,219 @@ impl PromptApp {
         self.clamp_block_view();
         self.grid_dirty = true;
         self.request_redraw();
+    }
+
+    // ---- block actions ----------------------------------------------------
+
+    fn block_action_at(&self, x: f32, y: f32) -> Option<BlockAction> {
+        self.block_view.as_ref()?;
+        self.block_actions
+            .iter()
+            .find(|hit| hit.rect.contains(x, y))
+            .map(|hit| hit.action)
+    }
+
+    fn copy_block_command(&mut self) {
+        let Some(index) = self.block_view.as_ref().map(|view| view.index) else {
+            return;
+        };
+        let Some(command) = self
+            .blocks
+            .get(index)
+            .map(|block| block.command.clone())
+            .filter(|command| !command.is_empty())
+        else {
+            self.toast("This block has no command to copy");
+            return;
+        };
+        self.write_clipboard(command);
+        self.toast("Copied command");
+    }
+
+    fn copy_block_output(&mut self) {
+        let Some(index) = self.block_view.as_ref().map(|view| view.index) else {
+            return;
+        };
+        if self
+            .session
+            .as_ref()
+            .map(|session| session.frame().alt_screen)
+            .unwrap_or(false)
+        {
+            self.toast("Output is unavailable while a full-screen program runs");
+            return;
+        }
+        let Some(text) = self.block_output_text(index) else {
+            self.toast("This block has no output to copy");
+            return;
+        };
+        self.write_clipboard(text);
+        self.toast("Copied output");
+    }
+
+    fn select_block_output(&mut self) {
+        let Some(index) = self.block_view.as_ref().map(|view| view.index) else {
+            return;
+        };
+        if self
+            .session
+            .as_ref()
+            .map(|session| session.frame().alt_screen)
+            .unwrap_or(false)
+        {
+            self.toast("Output is unavailable while a full-screen program runs");
+            return;
+        }
+        let Some((start, end)) = self
+            .blocks
+            .get(index)
+            .and_then(|block| block.output_range())
+            .or_else(|| self.block_range(index))
+        else {
+            return;
+        };
+        if start > end {
+            return;
+        }
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        session.select_row_range(start, end);
+        session.scroll_to_row(start);
+        session.update_frame();
+        self.block_view = None;
+        self.block_actions.clear();
+        self.hover_block_action = None;
+        self.pending_highlight = None;
+        self.focus = Focus::Grid;
+        self.grid_dirty = true;
+        self.request_redraw();
+        self.toast("Selected block output · copy with the usual shortcut");
+    }
+
+    fn block_output_text(&mut self, index: usize) -> Option<String> {
+        let (start, end) = {
+            let block = self.blocks.get(index)?;
+            match block.output_range() {
+                Some(range) => range,
+                // The command may still be running; copy what is there so far.
+                None if block.end_row.is_none() => {
+                    let (header, _) = self.block_range(index)?;
+                    let start = block.output_start.unwrap_or(header.saturating_add(1));
+                    let end = self
+                        .session
+                        .as_ref()
+                        .map(|session| session.scrollbar().total.saturating_sub(1))
+                        .unwrap_or(start);
+                    (start, end)
+                }
+                None => return None,
+            }
+        };
+        if start > end {
+            return None;
+        }
+        let text = self.block_text(start, end).join("\n");
+        let text = text.trim_end().to_string();
+        (!text.trim().is_empty()).then_some(text)
+    }
+
+    fn rerun_block(&mut self) {
+        let Some(index) = self.block_view.as_ref().map(|view| view.index) else {
+            return;
+        };
+        let Some(command) = self
+            .blocks
+            .get(index)
+            .map(|block| block.command.clone())
+            .filter(|command| !command.trim().is_empty())
+        else {
+            self.toast("This block has no command to rerun");
+            return;
+        };
+        if self.mode == Mode::Running {
+            self.toast("Wait for the running command, or interrupt it with ctrl-c");
+            return;
+        }
+        if self
+            .session
+            .as_ref()
+            .map(|session| session.frame().alt_screen)
+            .unwrap_or(false)
+        {
+            self.toast("Exit the full-screen program before rerunning a block");
+            return;
+        }
+        self.close_block_view();
+        self.editor.set_text(&command);
+        self.focus = Focus::Composer;
+        self.after_edit();
+        self.submit();
+    }
+
+    fn edit_block(&mut self) {
+        let Some(index) = self.block_view.as_ref().map(|view| view.index) else {
+            return;
+        };
+        let Some(command) = self.blocks.get(index).map(|block| block.command.clone()) else {
+            return;
+        };
+        if self.mode == Mode::Running
+            || self
+                .session
+                .as_ref()
+                .map(|session| session.frame().alt_screen)
+                .unwrap_or(false)
+        {
+            self.toast("Wait for the running program before editing a block");
+            return;
+        }
+        self.close_block_view();
+        self.editor.set_text(&command);
+        self.focus = Focus::Composer;
+        self.history_index = None;
+        self.completion_popup = None;
+        self.after_edit();
+        self.toast("Edit the command, then press enter to run");
+    }
+
+    fn toggle_block_collapsed(&mut self, index: usize) {
+        let Some(block) = self.blocks.get_mut(index) else {
+            return;
+        };
+        let Some(lines) = block.line_count() else {
+            self.toast("Wait for the command to finish");
+            return;
+        };
+        if lines <= BLOCK_WINDOW {
+            self.toast("This block is short enough to show in full");
+            return;
+        }
+        block.collapsed = !block.collapsed;
+        let collapsed = block.collapsed;
+        self.grid_dirty = true;
+        self.request_redraw();
+        self.toast(if collapsed {
+            "Block collapsed in the grid · click the hidden-lines marker to expand"
+        } else {
+            "Block expanded in the grid"
+        });
+    }
+
+    fn run_block_action(&mut self, action: BlockAction) {
+        match action {
+            BlockAction::CopyCommand => self.copy_block_command(),
+            BlockAction::CopyOutput => self.copy_block_output(),
+            BlockAction::SelectOutput => self.select_block_output(),
+            BlockAction::Rerun => self.rerun_block(),
+            BlockAction::Edit => self.edit_block(),
+            BlockAction::ToggleCollapse => {
+                let Some(index) = self.block_view.as_ref().map(|view| view.index) else {
+                    return;
+                };
+                self.toggle_block_collapsed(index);
+            }
+        }
     }
 
     /// Read a block's text a viewport at a time. Used lazily by search.
@@ -2430,6 +2751,33 @@ impl PromptApp {
             self.send_bytes(&[3]);
             return true;
         }
+        if code == KeyCode::KeyC && !primary && !ctrl {
+            self.copy_block_command();
+            return true;
+        }
+        if code == KeyCode::KeyY && !primary && !ctrl {
+            self.copy_block_output();
+            return true;
+        }
+        if code == KeyCode::KeyV && !primary && !ctrl {
+            self.select_block_output();
+            return true;
+        }
+        if code == KeyCode::KeyR && !primary && !ctrl {
+            self.rerun_block();
+            return true;
+        }
+        if shift && code == KeyCode::KeyE {
+            self.edit_block();
+            return true;
+        }
+        if code == KeyCode::KeyZ && !primary && !ctrl && !shift {
+            let index = self.block_view.as_ref().map(|view| view.index);
+            if let Some(index) = index {
+                self.toggle_block_collapsed(index);
+            }
+            return true;
+        }
         if primary && shift && matches!(code, KeyCode::ArrowUp | KeyCode::ArrowDown) {
             self.switch_block(if code == KeyCode::ArrowUp { -1 } else { 1 });
             return true;
@@ -2526,7 +2874,14 @@ impl PromptApp {
         let command = self
             .blocks
             .get(view.index)
-            .map(|block| block.command.replace('\n', " ⏎ "))
+            .map(|block| {
+                let command = block.command.replace('\n', " ⏎ ");
+                if command.is_empty() {
+                    display_path(&block.cwd)
+                } else {
+                    format!("{command}   ·   {}", display_path(&block.cwd))
+                }
+            })
             .unwrap_or_default();
         (command, self.theme.dim)
     }
@@ -3383,8 +3738,14 @@ impl PromptApp {
 
     fn forward_key(&mut self, event: &KeyEvent, code: KeyCode) {
         let text = event.text.as_deref();
+        // The layout's unmodified key: Ghostty needs it to encode chords
+        // correctly when a program enables Kitty's keyboard protocol.
+        let unshifted = match event.key_without_modifiers() {
+            Key::Character(text) => text.chars().next(),
+            _ => None,
+        };
         let bytes = match &mut self.session {
-            Some(session) => keys::encode(session, code, self.modifiers, text),
+            Some(session) => keys::encode(session, code, self.modifiers, text, unshifted),
             None => Vec::new(),
         };
         if !bytes.is_empty() {
@@ -4019,6 +4380,16 @@ impl PromptApp {
         if state == ElementState::Released && self.drag_divider.take().is_some() {
             return;
         }
+        if state == ElementState::Pressed {
+            if let Some(action) = self.block_action_at(x, y) {
+                self.run_block_action(action);
+                return;
+            }
+            if let Some(index) = self.collapsed_marker_at(x, y) {
+                self.toggle_block_collapsed(index);
+                return;
+            }
+        }
         if state == ElementState::Pressed && self.mouse_in_panel(x, y) {
             if let Some(entry) = self.panel_entry_at(x, y) {
                 if let Some((cx, cy, cw, ch)) = entry.close {
@@ -4185,6 +4556,17 @@ impl PromptApp {
         if hovered != self.hover_control {
             self.hover_control = hovered;
             self.request_redraw();
+        }
+        let block_action = self.block_action_at(x, y);
+        if block_action != self.hover_block_action {
+            self.hover_block_action = block_action;
+            self.request_redraw();
+        }
+        if block_action.is_some() || self.collapsed_marker_at(x, y).is_some() {
+            if let Some(window) = &self.window {
+                window.set_cursor(winit::window::CursorIcon::Pointer);
+            }
+            return;
         }
         if hovered.is_some() {
             if let Some(window) = &self.window {
@@ -4391,28 +4773,58 @@ impl PromptApp {
         })
     }
 
-    fn grid_content_pad(&self) -> f32 {
-        if self.block_view.is_some() {
-            return 0.0;
-        }
+    /// Visible rows and top padding for the active pane. Shared by painting and
+    /// hit testing so a folded block maps clicks and selections to the real
+    /// scrollback rows.
+    fn grid_slots(&self) -> (Vec<GridSlot>, f32) {
         let Some(session) = &self.session else {
-            return 0.0;
+            return (Vec::new(), 0.0);
         };
         let hide_prompt = self.mode == Mode::Compose && !session.frame().alt_screen;
-        grid_content_offset(session, hide_prompt, self.text.cell_h)
+        grid_slots(
+            session,
+            &self.blocks,
+            hide_prompt,
+            self.block_view.is_none(),
+            self.text.cell_h,
+        )
     }
 
     fn viewport_cell(&self, x: f32, y: f32) -> Option<(u16, u16)> {
         if !self.mouse_in_grid(x, y) {
             return None;
         }
-        let pad = self.grid_content_pad();
+        let (slots, pad) = self.grid_slots();
         let cx = ((x - self.grid.x) / self.text.cell_w).floor() as i32;
-        let cy = ((y - self.grid.y - pad) / self.text.cell_h).floor() as i32;
-        if cx < 0 || cy < 0 || cx >= self.grid.cols as i32 || cy >= self.grid.rows as i32 {
+        let display_y = ((y - self.grid.y - pad) / self.text.cell_h).floor() as i32;
+        if cx < 0 || display_y < 0 || cx >= self.grid.cols as i32 {
+            return None;
+        }
+        let GridSlot::Row(abs) = *slots.get(display_y as usize)? else {
+            return None;
+        };
+        let session = self.session.as_ref()?;
+        let cy = abs.checked_sub(session.scrollbar().offset)?;
+        if cy >= session.frame().rows as u64 {
             return None;
         }
         Some((cx as u16, cy as u16))
+    }
+
+    /// Block whose collapsed-output marker is under the pointer, if any.
+    fn collapsed_marker_at(&self, x: f32, y: f32) -> Option<usize> {
+        if !self.mouse_in_grid(x, y) || self.block_view.is_some() {
+            return None;
+        }
+        let (slots, pad) = self.grid_slots();
+        let display_y = ((y - self.grid.y - pad) / self.text.cell_h).floor() as i32;
+        if display_y < 0 {
+            return None;
+        }
+        match slots.get(display_y as usize)? {
+            GridSlot::Hidden { block, .. } => Some(*block),
+            GridSlot::Row(_) => None,
+        }
     }
 
     fn card_line_col(&self, x: f32, y: f32) -> (usize, usize) {
@@ -4796,7 +5208,7 @@ impl PromptApp {
             let dx = pane.anim.x - pane.layout.rect.x;
             let dy = pane.anim.y - pane.layout.rect.y;
             let clip = pane.anim.clip();
-            self.draw_pane_header_from(&pane.layout, &pane.state, false, (dx, dy), clip);
+            self.draw_pane_header_from(&pane.layout, &pane.state, false, (dx, dy), clip, pane.id);
             self.draw_inactive_card_from(&pane.layout, &pane.state, (dx, dy), clip);
         }
         self.closing_panes = closing;
@@ -4807,7 +5219,8 @@ impl PromptApp {
             return;
         }
         let controls = self.single_controls.clone();
-        let hovered = self.hover_control.map(|(_, action)| action);
+        let hovered = self.hover_control;
+        let active_pane = self.active_pane;
         let cell_h = self.text.cell_h;
         let scale = self.scale;
         let theme = self.theme.clone();
@@ -4820,7 +5233,7 @@ impl PromptApp {
             scale,
         };
         for control in controls {
-            let is_hover = hovered == Some(control.action);
+            let is_hover = hovered == Some((active_pane, control.action));
             let bg = if is_hover {
                 theme.panel_raised
             } else {
@@ -4879,7 +5292,7 @@ impl PromptApp {
         } else if let Some(state) = &slot.state {
             let state: *const PaneState = state;
             let state = unsafe { &*state };
-            self.draw_pane_header_from(&layout, state, false, offset, clip);
+            self.draw_pane_header_from(&layout, state, false, offset, clip, id);
         }
     }
 
@@ -4890,18 +5303,12 @@ impl PromptApp {
         active: bool,
         offset: (f32, f32),
         clip: Clip,
+        hover_id: u64,
     ) {
         let title = format!("{} · {}", self.launch.kind.name(), display_path(&state.cwd));
         let controls = layout.controls.clone();
         self.draw_header_common(
-            layout,
-            &title,
-            state.mode,
-            &controls,
-            active,
-            offset,
-            clip,
-            u64::MAX,
+            layout, &title, state.mode, &controls, active, offset, clip, hover_id,
         );
     }
 
@@ -4986,8 +5393,7 @@ impl PromptApp {
                 control.rect.w,
                 control.rect.h,
             );
-            let is_hover = hovered.map(|(_, action)| action) == Some(control.action)
-                && (hover_id == u64::MAX || hovered.map(|(id, _)| id) == Some(hover_id));
+            let is_hover = hovered == Some((hover_id, control.action));
             let bg = if is_hover { theme.accent } else { theme.panel };
             fill_clipped(
                 &mut painter,
@@ -5471,7 +5877,7 @@ impl PromptApp {
         }
         let hint_clip = Clip::new(card_x + pad, hint_y, card_w - pad * 2.0, hint_h);
         let long_hint: String = if block_view {
-            "esc exit   [ ] blocks   g/G top/bottom   e expand   / search   ↑↓ scroll".into()
+            "esc exit   [ ] blocks   c copy   y output   v select   r rerun   E edit   e expand   / search".into()
         } else if let Some(generation) = &self.generation {
             format!("{}   ·   esc cancel", generation.status)
         } else {
@@ -5489,7 +5895,7 @@ impl PromptApp {
             .into()
         };
         let short_hint: String = if block_view {
-            "esc exit   / search   e expand".into()
+            "esc exit   c copy   r rerun   E edit".into()
         } else if self.generation.is_some() {
             "generating… esc cancel".into()
         } else {
@@ -5709,6 +6115,7 @@ fn draw_editor(
 impl PromptApp {
     fn draw_block_bar(&mut self) {
         let Some(view) = &self.block_view else {
+            self.block_actions.clear();
             return;
         };
         let index = view.index;
@@ -5721,7 +6128,18 @@ impl PromptApp {
             .block_window(index, expanded)
             .map(|(start, end)| end.saturating_sub(start) + 1)
             .unwrap_or(0);
-        let status = self.blocks.get(index).and_then(|block| block.status);
+        let block = self.blocks.get(index);
+        let command = block
+            .map(|block| command_preview(&block.command, 90))
+            .unwrap_or_default();
+        let status = block.and_then(|block| block.status);
+        let cwd = block.map(|block| display_path(&block.cwd));
+        let duration = block.map(|block| block.duration.unwrap_or_else(|| block.started.elapsed()));
+        let can_collapse = block
+            .and_then(|block| block.line_count())
+            .map(|lines| lines > BLOCK_WINDOW)
+            .unwrap_or(false);
+        let collapsed = block.map(|block| block.collapsed).unwrap_or(false);
         let search = view.search.as_ref().map(|search| {
             (
                 search.query.clone(),
@@ -5731,14 +6149,28 @@ impl PromptApp {
             )
         });
 
+        let title = if command.is_empty() {
+            "◆ block".to_string()
+        } else {
+            format!("◆ {command}")
+        };
         let mut text = format!(
-            "◆ block {}/{}  ·  {total} line{}",
+            "block {}/{}  ·  {total} line{}",
             index + 1,
             self.blocks.len(),
             if total == 1 { "" } else { "s" }
         );
         if shown < total {
             text.push_str(&format!("  ·  {shown} shown"));
+        }
+        if collapsed {
+            text.push_str("  ·  folded");
+        }
+        if let Some(cwd) = cwd {
+            text.push_str(&format!("  ·  {cwd}"));
+        }
+        if let Some(duration) = duration {
+            text.push_str(&format!("  ·  {}", format_duration(duration)));
         }
         match status {
             Some(0) => text.push_str("  ·  exit 0"),
@@ -5756,6 +6188,29 @@ impl PromptApp {
         let scale = self.scale;
         let grid = self.grid;
         let theme = self.theme.clone();
+        let pad = 8.0 * scale;
+        let h = cell_h + 2.0 * scale;
+        let x = grid.x;
+        let y = if self.panes.len() > 1 {
+            grid.y + 2.0 * scale
+        } else {
+            (2.0 * scale).min((grid.y - h).max(1.0))
+        };
+
+        let mut actions = vec![
+            (BlockAction::CopyCommand, "copy cmd"),
+            (BlockAction::CopyOutput, "copy output"),
+            (BlockAction::SelectOutput, "select"),
+            (BlockAction::Rerun, "rerun"),
+            (BlockAction::Edit, "edit"),
+        ];
+        if can_collapse {
+            actions.push((
+                BlockAction::ToggleCollapse,
+                if collapsed { "expand" } else { "collapse" },
+            ));
+        }
+
         let Some(canvas) = self.canvas.as_mut() else {
             return;
         };
@@ -5764,28 +6219,97 @@ impl PromptApp {
             text: &mut self.text,
             scale,
         };
-        let text_w = painter.text.measure_text(&text, false);
-        let pad = 8.0 * scale;
-        let w = (text_w + pad * 2.0).min(grid.w).max(40.0 * scale);
-        let h = cell_h + 2.0 * scale;
-        let x = grid.x;
-        let y = if self.panes.len() > 1 {
-            grid.y + 2.0 * scale
+        let action_h = (cell_h - 2.0 * scale).max(10.0);
+        let action_pad = 6.0 * scale;
+        let gap = 4.0 * scale;
+        let widths: Vec<f32> = actions
+            .iter()
+            .map(|(_, label)| painter.text.measure_text(label, false) + action_pad * 2.0)
+            .collect();
+        let actions_w: f32 =
+            widths.iter().sum::<f32>() + gap * (widths.len().saturating_sub(1)) as f32;
+        let title_w = painter.text.measure_text(&title, true);
+        let meta_w = painter.text.measure_text(&text, false);
+        let text_w = title_w + gap + meta_w;
+        let show_actions = grid.w >= actions_w + 120.0 * scale;
+        let w = if show_actions {
+            (text_w + actions_w + pad * 2.0 + 12.0 * scale)
+                .min(grid.w)
+                .max(40.0 * scale)
         } else {
-            (2.0 * scale).min((grid.y - h).max(1.0))
+            (text_w + pad * 2.0).min(grid.w).max(40.0 * scale)
         };
         painter.rounded(x, y, w, h, 5.0 * scale, theme.panel_raised, 1.0);
         painter.rounded_stroke(x, y, w, h, 5.0 * scale, scale.max(1.0), theme.border, 0.9);
-        painter.text(
+
+        let actions_left = if show_actions {
+            x + w - pad - actions_w
+        } else {
+            x + w
+        };
+        let text_clip_w = (actions_left - (x + pad) - 6.0 * scale).max(10.0);
+        let available = if show_actions {
+            text_clip_w
+        } else {
+            w - pad * 2.0
+        };
+        let text_y = y + (h - cell_h) / 2.0;
+        let text_clip = Clip::new(x, y, w, h);
+        let drawn_title = painter.text(
             x + pad,
-            y + (h - cell_h) / 2.0,
-            &text,
-            theme.dim,
-            false,
+            text_y,
+            &title,
+            theme.fg,
+            true,
             None,
-            Clip::new(x, y, w, h),
-            w - pad * 2.0,
+            text_clip,
+            available.min(title_w + 4.0),
         );
+        if drawn_title + gap < available {
+            painter.text(
+                x + pad + drawn_title + gap,
+                text_y,
+                &text,
+                theme.dim,
+                false,
+                None,
+                text_clip,
+                available - drawn_title - gap,
+            );
+        }
+
+        self.block_actions.clear();
+        if show_actions {
+            let mut bx = actions_left;
+            let by = y + (h - action_h) / 2.0;
+            for ((action, label), bw) in actions.iter().zip(widths.iter()) {
+                let hovered = self.hover_block_action == Some(*action);
+                painter.rounded(
+                    bx,
+                    by,
+                    *bw,
+                    action_h,
+                    4.0 * scale,
+                    if hovered { theme.panel } else { theme.bg },
+                    1.0,
+                );
+                painter.text(
+                    bx + action_pad,
+                    by + (action_h - cell_h) / 2.0,
+                    label,
+                    if hovered { theme.accent } else { theme.dim },
+                    false,
+                    None,
+                    Clip::new(bx, by, *bw, action_h),
+                    bw - action_pad * 2.0,
+                );
+                self.block_actions.push(BlockActionHit {
+                    rect: Rect::new(bx, by, *bw, action_h),
+                    action: *action,
+                });
+                bx += bw + gap;
+            }
+        }
     }
 
     fn draw_background_panel(&mut self) {
@@ -6599,16 +7123,87 @@ fn draw_dividers(
     }
 }
 
-/// Empty space above the terminal content when a block is shorter than the
-/// grid. Anchoring blocks to the bottom keeps the newest output next to the
-/// composer.
-fn grid_content_offset(session: &TerminalSession, ignore_prompt: bool, cell_h: f32) -> f32 {
+/// Rows visible in the viewport after folding collapsed blocks. The returned
+/// offset is the empty space above the content when a block is shorter than
+/// the grid: anchoring to the bottom keeps the newest output next to the
+/// composer. `align_bottom` is false for block view, where folding is handled
+/// by its own 300-line window.
+fn grid_slots(
+    session: &TerminalSession,
+    blocks: &[Block],
+    hide_prompt: bool,
+    align_bottom: bool,
+    cell_h: f32,
+) -> (Vec<GridSlot>, f32) {
     let frame = session.frame();
     if frame.alt_screen {
-        return 0.0;
+        let rows = (0..frame.rows as u64)
+            .map(|y| GridSlot::Row(frame.scrollbar.offset + y))
+            .collect();
+        return (rows, 0.0);
     }
-    let used = session.content_rows(ignore_prompt);
-    frame.rows.saturating_sub(used) as f32 * cell_h
+    let offset = frame.scrollbar.offset;
+    let viewport_rows = frame.rows as u64;
+    if viewport_rows == 0 {
+        return (Vec::new(), 0.0);
+    }
+    let visible_rows = if align_bottom {
+        session.content_rows(hide_prompt) as u64
+    } else {
+        viewport_rows
+    };
+    if visible_rows == 0 {
+        return (Vec::new(), viewport_rows as f32 * cell_h);
+    }
+    let last_abs = offset + visible_rows.saturating_sub(1);
+    // Keep the hidden-lines marker on screen even in a short window by
+    // shrinking the visible tail when the viewport is small.
+    let tail = BLOCK_COLLAPSE_TAIL
+        .min(viewport_rows.saturating_sub(6))
+        .max(3);
+    let mut slots = Vec::with_capacity(visible_rows as usize);
+    let mut abs = offset;
+    while abs <= last_abs {
+        let hidden = if align_bottom {
+            blocks.iter().enumerate().find_map(|(index, block)| {
+                match block.hidden_range_with_tail(tail) {
+                    Some((start, end)) if abs >= start && abs <= end => Some((index, start, end)),
+                    _ => None,
+                }
+            })
+        } else {
+            None
+        };
+        match hidden {
+            Some((block, start, end)) => {
+                slots.push(GridSlot::Hidden {
+                    block,
+                    lines: end.saturating_sub(start) + 1,
+                });
+                abs = end.saturating_add(1);
+            }
+            None => {
+                slots.push(GridSlot::Row(abs));
+                abs += 1;
+            }
+        }
+    }
+    // When a folded block removes rows from a viewport that is not at the
+    // bottom, start at the top instead of pushing the remaining rows down.
+    // At the bottom, keep the newest output next to the composer.
+    let at_bottom = offset + viewport_rows >= frame.scrollbar.total;
+    let pad = if align_bottom && (at_bottom || visible_rows < viewport_rows) {
+        viewport_rows.saturating_sub(slots.len() as u64) as f32 * cell_h
+    } else {
+        0.0
+    };
+    (slots, pad)
+}
+
+fn slot_row_index(slots: &[GridSlot], row: u64) -> Option<usize> {
+    slots
+        .iter()
+        .position(|slot| matches!(slot, GridSlot::Row(abs) if *abs == row))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6629,11 +7224,7 @@ fn paint_grid(
     // The composer is the only input line while it owns the keyboard, so leave
     // the shell's live prompt out of the grid instead of showing two cursors.
     let hide_prompt = mode == Mode::Compose && !frame.alt_screen;
-    let content_offset = if align_bottom {
-        grid_content_offset(session, hide_prompt, cell_h)
-    } else {
-        0.0
-    };
+    let (slots, content_offset) = grid_slots(session, blocks, hide_prompt, align_bottom, cell_h);
     let base_clip = Clip::new(grid.x, grid.y, grid.w, grid.h);
     let clip = outer_clip
         .map(|outer| base_clip.intersect(outer))
@@ -6659,14 +7250,12 @@ fn paint_grid(
     // so commands stay distinguishable while scrolling through scrollback.
     if !blocks.is_empty() && !frame.alt_screen {
         let offset = frame.scrollbar.offset;
-        let row_count = frame.rows as u64;
-        let visible = offset..offset.saturating_add(row_count);
-        for block in blocks {
+        for (index, block) in blocks.iter().enumerate() {
             let header = block.start_row;
             let end = block
                 .end_row
                 .map(|row| row.saturating_sub(1))
-                .unwrap_or(offset.saturating_add(row_count.saturating_sub(1)));
+                .unwrap_or(offset.saturating_add(frame.rows.saturating_sub(1) as u64));
             // A full-screen program can repaint the rows a block used to
             // occupy (top, for example, stays on the primary screen). Only
             // decorate the block when its command line is still there.
@@ -6682,11 +7271,13 @@ fn paint_grid(
             if expected.is_empty() {
                 continue;
             }
-            let header_text = if visible.contains(&header) {
-                frame.row_text((header - offset) as u16)
-            } else {
-                None
-            };
+            let header_index = slot_row_index(&slots, header);
+            let header_text = header_index.and_then(|_| {
+                let viewport_y = header.checked_sub(offset)?;
+                (viewport_y < frame.rows as u64)
+                    .then(|| frame.row_text(viewport_y as u16))
+                    .flatten()
+            });
             let header_ok = header_text
                 .as_deref()
                 .map(|text| text.contains(&expected))
@@ -6699,8 +7290,8 @@ fn paint_grid(
                 Some(0) => theme.dim,
                 Some(_) => theme.red,
             };
-            if visible.contains(&header) {
-                let y = grid.y + content_offset + (header - offset) as f32 * cell_h;
+            if let Some(row) = header_index {
+                let y = grid.y + content_offset + row as f32 * cell_h;
                 fill_clipped(painter, clip, grid.x, y, grid.w, cell_h, theme.accent, 0.06);
                 fill_clipped(
                     painter,
@@ -6713,30 +7304,118 @@ fn paint_grid(
                     1.0,
                 );
             }
-            let first = header.max(offset);
-            let last = end.min(visible.end.saturating_sub(1));
-            if last >= first {
-                let top =
-                    grid.y + content_offset + (first - offset) as f32 * cell_h + cell_h * 0.15;
-                let height = (last - first + 1) as f32 * cell_h - cell_h * 0.3;
-                fill_clipped(
-                    painter,
-                    clip,
-                    grid.x - 8.0 * scale,
-                    top,
-                    (2.0 * scale).max(1.0),
-                    height,
-                    color,
-                    0.5,
-                );
+            let first = slots.iter().position(|slot| match slot {
+                GridSlot::Row(row) => *row >= header && *row <= end,
+                GridSlot::Hidden { block: hidden, .. } => *hidden == index,
+            });
+            let last = slots.iter().rposition(|slot| match slot {
+                GridSlot::Row(row) => *row >= header && *row <= end,
+                GridSlot::Hidden { block: hidden, .. } => *hidden == index,
+            });
+            if let (Some(first), Some(last)) = (first, last) {
+                if last >= first {
+                    let top = grid.y + content_offset + first as f32 * cell_h + cell_h * 0.15;
+                    let height = (last - first + 1) as f32 * cell_h - cell_h * 0.3;
+                    fill_clipped(
+                        painter,
+                        clip,
+                        grid.x - 8.0 * scale,
+                        top,
+                        (2.0 * scale).max(1.0),
+                        height,
+                        color,
+                        0.5,
+                    );
+                }
             }
         }
     }
 
     let mut run: Option<Run> = None;
-    let mut run_y;
-    for row in &frame.rows_view {
-        let y_top = grid.y + content_offset + row.y as f32 * cell_h;
+    let mut run_y = grid.y + content_offset;
+    let offset = frame.scrollbar.offset;
+    for (index, slot) in slots.iter().enumerate() {
+        let y_top = grid.y + content_offset + index as f32 * cell_h;
+        if let GridSlot::Hidden { block, lines } = slot {
+            if let Some(r) = run.take() {
+                draw_run_at(
+                    painter,
+                    &r,
+                    grid.x + r.x as f32 * cell_w,
+                    run_y,
+                    cell_w,
+                    cell_h,
+                    &clip,
+                );
+            }
+            let command = blocks
+                .get(*block)
+                .map(|block| command_preview(&block.command, 48))
+                .unwrap_or_default();
+            let color = blocks
+                .get(*block)
+                .map(|block| match block.status {
+                    Some(0) => theme.dim,
+                    Some(_) => theme.red,
+                    None => theme.accent,
+                })
+                .unwrap_or(theme.dim);
+            fill_clipped(
+                painter,
+                clip,
+                grid.x,
+                y_top,
+                grid.w,
+                cell_h,
+                theme.panel_raised,
+                1.0,
+            );
+            fill_clipped(
+                painter,
+                clip,
+                grid.x,
+                y_top,
+                (2.0 * scale).max(1.0),
+                cell_h,
+                color,
+                0.65,
+            );
+            let label = if command.is_empty() {
+                format!(
+                    "▸ {lines} line{} hidden · click to expand",
+                    if *lines == 1 { "" } else { "s" }
+                )
+            } else {
+                format!(
+                    "▸ {command}  ·  {lines} line{} hidden · click to expand",
+                    if *lines == 1 { "" } else { "s" }
+                )
+            };
+            painter.text(
+                grid.x + 12.0 * scale,
+                y_top + (cell_h - painter.text.cell_h) / 2.0,
+                &label,
+                theme.dim,
+                false,
+                Some(painter.text.cell_w),
+                clip,
+                (grid.w - 18.0 * scale).max(10.0),
+            );
+            continue;
+        }
+        let GridSlot::Row(abs) = slot else {
+            continue;
+        };
+        let Some(viewport_y) = abs.checked_sub(offset) else {
+            continue;
+        };
+        let Some(row) = frame
+            .rows_view
+            .iter()
+            .find(|row| row.y as u64 == viewport_y)
+        else {
+            continue;
+        };
         run_y = y_top;
         // Backgrounds and selection. Background first so selection stays
         // visible over coloured cells (warnings, diffs, etc.).
@@ -6841,43 +7520,46 @@ fn paint_grid(
             true
         };
         if show {
-            let alpha = if active { 0.9 } else { 0.42 };
-            let cx = grid.x + cursor.x as f32 * cell_w;
-            let cy = grid.y + content_offset + cursor.y as f32 * cell_h;
-            match cursor.style {
-                CursorStyle::Bar => fill_clipped(
-                    painter,
-                    clip,
-                    cx,
-                    cy,
-                    (cell_w * 0.12).max(2.0),
-                    cell_h,
-                    theme.cursor,
-                    alpha,
-                ),
-                CursorStyle::Block => {
-                    fill_clipped(painter, clip, cx, cy, cell_w, cell_h, theme.cursor, 0.45)
+            let cursor_abs = offset + cursor.y as u64;
+            if let Some(cursor_row) = slot_row_index(&slots, cursor_abs) {
+                let alpha = if active { 0.9 } else { 0.42 };
+                let cx = grid.x + cursor.x as f32 * cell_w;
+                let cy = grid.y + content_offset + cursor_row as f32 * cell_h;
+                match cursor.style {
+                    CursorStyle::Bar => fill_clipped(
+                        painter,
+                        clip,
+                        cx,
+                        cy,
+                        (cell_w * 0.12).max(2.0),
+                        cell_h,
+                        theme.cursor,
+                        alpha,
+                    ),
+                    CursorStyle::Block => {
+                        fill_clipped(painter, clip, cx, cy, cell_w, cell_h, theme.cursor, 0.45)
+                    }
+                    CursorStyle::Underline => fill_clipped(
+                        painter,
+                        clip,
+                        cx,
+                        cy + cell_h - scale_line(scale),
+                        cell_w,
+                        (2.0 * scale).max(1.5),
+                        theme.cursor,
+                        alpha,
+                    ),
+                    CursorStyle::HollowBlock => fill_clipped(
+                        painter,
+                        clip,
+                        cx + 1.0,
+                        cy + 1.0,
+                        cell_w - 2.0,
+                        cell_h - 2.0,
+                        theme.cursor,
+                        alpha,
+                    ),
                 }
-                CursorStyle::Underline => fill_clipped(
-                    painter,
-                    clip,
-                    cx,
-                    cy + cell_h - scale_line(scale),
-                    cell_w,
-                    (2.0 * scale).max(1.5),
-                    theme.cursor,
-                    alpha,
-                ),
-                CursorStyle::HollowBlock => fill_clipped(
-                    painter,
-                    clip,
-                    cx + 1.0,
-                    cy + 1.0,
-                    cell_w - 2.0,
-                    cell_h - 2.0,
-                    theme.cursor,
-                    alpha,
-                ),
             }
         }
     }
@@ -6976,22 +7658,27 @@ fn current_row_in(session: &mut TerminalSession) -> u64 {
     offset + y
 }
 
-fn note_output_start_in(blocks: &mut Vec<Block>, session: &mut TerminalSession, command: &str) {
+fn note_output_start_in(
+    blocks: &mut Vec<Block>,
+    session: &mut TerminalSession,
+    command: &str,
+    cwd: PathBuf,
+) {
+    let row = current_row_in(session);
     if let Some(block) = blocks.last_mut() {
         if block.end_row.is_none() {
             if !command.is_empty() {
                 block.command = command.to_string();
             }
+            if block.output_start.is_none() {
+                block.output_start = Some(row);
+            }
             return;
         }
     }
-    let row = current_row_in(session).saturating_sub(1);
-    blocks.push(Block {
-        command: command.to_string(),
-        start_row: row,
-        end_row: None,
-        status: None,
-    });
+    let mut block = Block::new(command.to_string(), row.saturating_sub(1), cwd);
+    block.output_start = Some(row);
+    blocks.push(block);
     if blocks.len() > 200 {
         blocks.remove(0);
     }
@@ -7020,7 +7707,7 @@ fn apply_pane_event(state: &mut PaneState, event: TermEvent) {
                 state.running_cmd = command.clone();
             }
             if let Some(session) = &mut state.session {
-                note_output_start_in(&mut state.blocks, session, &command);
+                note_output_start_in(&mut state.blocks, session, &command, state.cwd.clone());
             }
         }
         TermEvent::CommandEnd { exit_code } => {
@@ -7063,6 +7750,13 @@ fn close_open_block(blocks: &mut [Block], session: &mut TerminalSession, status:
     let row = session.scrollbar().total.saturating_sub(1);
     block.end_row = Some(row.max(block.start_row));
     block.status = status;
+    block.duration = Some(block.started.elapsed());
+    // Long output stays readable in the normal grid: keep the command, a little
+    // leading context and the tail, and fold the middle behind a one-line
+    // marker. `e` in block view and the marker's click action can expand it.
+    if block.end_row.unwrap_or(0).saturating_sub(block.start_row) + 1 > BLOCK_WINDOW {
+        block.collapsed = true;
+    }
 }
 
 /// Last useful output line for the background panel. A running command shows
@@ -7131,6 +7825,34 @@ fn normalize_paste(text: &str) -> String {
         out.pop();
     }
     out
+}
+
+/// A single-line preview of a block command for headers. Multi-line commands
+/// get a return hint so the bar never grows into a paragraph.
+fn command_preview(command: &str, max_chars: usize) -> String {
+    let first = command
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .trim();
+    let mut out: String = first.chars().take(max_chars).collect();
+    if first.chars().count() > max_chars || command.lines().count() > 1 {
+        out.push('…');
+    }
+    out
+}
+
+fn format_duration(duration: Duration) -> String {
+    let secs = duration.as_secs_f32();
+    if secs < 1.0 {
+        format!("{}ms", duration.as_millis())
+    } else if secs < 60.0 {
+        format!("{secs:.1}s")
+    } else {
+        let minutes = duration.as_secs() / 60;
+        let seconds = duration.as_secs() % 60;
+        format!("{minutes}m {seconds}s")
+    }
 }
 
 fn display_path(path: &Path) -> String {
@@ -7366,5 +8088,38 @@ mod split_tests {
             panic!("root should stay a split");
         };
         assert!(matches!(second.as_ref(), PaneNode::Leaf(2)));
+    }
+
+    #[test]
+    fn command_preview_keeps_one_line_and_marks_truncation() {
+        assert_eq!(command_preview("  ls -la  ", 20), "ls -la");
+        assert_eq!(command_preview("echo one\necho two", 20), "echo one…");
+        assert_eq!(command_preview("abcdef", 3), "abc…");
+    }
+
+    #[test]
+    fn block_output_range_excludes_the_command_row() {
+        let mut block = Block::new("ls".into(), 10, PathBuf::from("/tmp"));
+        block.output_start = Some(11);
+        block.end_row = Some(14);
+        assert_eq!(block.output_range(), Some((11, 14)));
+        assert_eq!(block.line_count(), Some(5));
+    }
+
+    #[test]
+    fn long_blocks_fold_the_middle_and_keep_the_tail() {
+        let mut block = Block::new("seq 1 400".into(), 10, PathBuf::from("/tmp"));
+        let end = 10 + BLOCK_WINDOW + 9;
+        block.end_row = Some(end);
+        assert_eq!(block.hidden_range(), None, "blocks start expanded");
+        block.collapsed = true;
+        assert_eq!(
+            block.hidden_range(),
+            Some((10 + BLOCK_COLLAPSE_HEAD, end - BLOCK_COLLAPSE_TAIL))
+        );
+
+        block.end_row = Some(12);
+        block.collapsed = true;
+        assert_eq!(block.hidden_range(), None, "short blocks never fold");
     }
 }

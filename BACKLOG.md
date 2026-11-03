@@ -1,10 +1,10 @@
 # Prompt — feature backlog
 
-Status: split panes landed after 0.0.7. Command blocks, background tabs,
-inline suggestions, macOS runtime validation and the DMG pipeline are in;
-on-device command generation is next. This is the working backlog for
-turning Prompt from a strong terminal prototype into the terminal for vibe coders
-and agentic development.
+Status: split panes landed after 0.0.7. Command blocks and their actions,
+background tabs, inline suggestions, macOS runtime validation and the DMG
+pipeline are in; on-device command generation is next. This is the working
+backlog for turning Prompt from a strong terminal prototype into the terminal
+for vibe coders and agentic development.
 
 The backlog is ordered, not exhaustive. Anything here can move if we learn
 something from users.
@@ -51,8 +51,11 @@ matter more than the number.
   pane, animated open/close, pane zoom, and visible split/zoom/close controls in
   each pane header. The background panel stays shared by the window.
 - **Command blocks** (0.0.3–0.0.4): every command becomes a block with a row
-  range and exit status; `Ctrl+Shift+B` opens block view with `[`/`]`, a 300-line
-  lazy reader, `/` search, `e` expand and `n`/`N` match navigation.
+  range, exit status, cwd, start time and duration; `Ctrl+Shift+B` opens block
+  view with `[`/`]`, a 300-line lazy reader, `/` search, `e` expand, `n`/`N`
+  match navigation, and copy-command/copy-output/select/rerun/edit actions
+  (also clickable in the block bar). Long finished blocks fold in the normal
+  grid behind a "N lines hidden" marker.
 - **Detachable background tabs** (0.0.3–0.0.7): `Ctrl+Shift+M` (formerly
   `Ctrl+Shift+D`) parks the running tab in the right-hand panel with a live
   output preview, running timer, exit status, scrollable list,
@@ -111,18 +114,21 @@ message. Make “why is this happening?” answerable.
 diagnostics into an issue without reading logs.
 
 ### DISC-01 · Command block actions
-**Value 5 · Effort M · Confidence H**
+**Value 5 · Effort M · Confidence H · Shipped**
 
 Blocks shipped in 0.0.3: every command has a row range and exit status, and
-`Ctrl+Shift+B` opens a readable block view with search and expand. Finish the
-interaction and metadata layer.
+`Ctrl+Shift+B` opens a readable block view with search and expand. The action
+and metadata layer is now in place.
 
-- rerun, edit-and-rerun, copy command and copy output
-- cwd, start time and duration in the block model (background tabs already keep
-  this; foreground blocks do not)
-- collapse/expand for long output in the normal grid, not only in block view
-- selection scoped to the block, with sane behavior for non-integrated shells
-  and full-screen programs
+- rerun, edit-and-rerun, copy command, copy output and select output (`r`,
+  `E`, `c`, `y`, `v`; also clickable in the block bar)
+- cwd, start time and duration live in the block model and the block bar shows
+  the command at the top of the block, plus directory, duration and status
+- finished blocks longer than 300 lines fold their middle in the normal grid to
+  a clickable “N lines hidden” row, keeping the command and output tail;
+  block view's `e` still expands the lazy reader
+- output selection uses absolute scrollback rows from the block model, and
+  actions refuse to run against full-screen programs
 
 **Done when:** selecting, copying and rerunning a command never depends on
 guessing pixel rows, and blocks survive terminal resize.
@@ -480,7 +486,7 @@ help without joining a Discord.
 | 3 | AGENT-03 | NL → command preview | Not started | 5 | L | M | Signature feature |
 | 4 | AGENT-13 | Apple Foundation Models | Implemented | 5 | M | M | Private, zero-setup AI on macOS 27+ and Linux |
 | 5 | AGENT-01 | Agent detection/status | Not started | 5 | M | M | Core differentiation |
-| 6 | DISC-01 | Block actions | Blocks shipped | 5 | M | H | Finish the discovery foundation |
+| 6 | DISC-01 | Block actions | Shipped | 5 | M | H | Finish the discovery foundation |
 | 7 | EDIT-02 | Completion v2 | Partial | 4 | M | M | Reduces typing and errors |
 | 8 | DISC-02 | History panel | Not started | 4 | M | H | Vibe-coder discoverability |
 | 9 | EDIT-10 | Command palette | Not started | 4 | M | H | Discoverability of the app |

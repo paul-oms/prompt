@@ -419,6 +419,7 @@ impl TerminalSession {
         mods: ffi::GhosttyMods,
         action: ffi::GhosttyKeyAction,
         text: Option<&str>,
+        unshifted: Option<char>,
     ) -> Vec<u8> {
         if self.encoder.is_null() || self.key_event.is_null() {
             return Vec::new();
@@ -428,6 +429,13 @@ impl TerminalSession {
             ffi::ghostty_key_event_set_action(self.key_event, action);
             ffi::ghostty_key_event_set_key(self.key_event, key);
             ffi::ghostty_key_event_set_mods(self.key_event, mods);
+            // Kitty's keyboard protocol needs the layout's unshifted
+            // codepoint to tell a modified key from plain text. Without it
+            // Ctrl+P would be sent as "p" to a kitty-aware program.
+            ffi::ghostty_key_event_set_unshifted_codepoint(
+                self.key_event,
+                unshifted.map(|c| c as u32).unwrap_or(0),
+            );
             match text {
                 Some(text) if !text.is_empty() => {
                     ffi::ghostty_key_event_set_utf8(
@@ -936,6 +944,43 @@ impl TerminalSession {
         }
     }
 
+    unsafe fn grid_ref_screen(&self, x: u16, y: u64) -> Option<ffi::GhosttyGridRef> {
+        let point = ffi::GhosttyPoint {
+            tag: ffi::GHOSTTY_POINT_TAG_SCREEN,
+            value: ffi::GhosttyPointValue {
+                coordinate: ffi::GhosttyPointCoordinate { x, y: y as u32 },
+            },
+        };
+        let mut reference = sized!(ffi::GhosttyGridRef);
+        let result = ffi::ghostty_terminal_grid_ref(self.term, point, &mut reference);
+        (result == ffi::GHOSTTY_SUCCESS).then_some(reference)
+    }
+
+    /// Select full rows by absolute scrollback row. This keeps block actions
+    /// independent of the current viewport and of pixel hit-testing.
+    pub fn select_row_range(&mut self, start: u64, end: u64) {
+        let cols = self.cols.max(1);
+        unsafe {
+            let Some(first) = self.grid_ref_screen(0, start) else {
+                return;
+            };
+            let Some(last) = self.grid_ref_screen(cols - 1, end) else {
+                return;
+            };
+            let selection = ffi::GhosttySelection {
+                size: size_of::<ffi::GhosttySelection>(),
+                start: first,
+                end: last,
+                rectangle: false,
+            };
+            ffi::ghostty_terminal_set(
+                self.term,
+                ffi::GHOSTTY_TERMINAL_OPT_SELECTION,
+                &selection as *const _ as *const c_void,
+            );
+        }
+    }
+
     pub fn set_selection(&mut self, start: Option<(u16, u16)>, end: (u16, u16)) {
         unsafe {
             let Some(first) = start.and_then(|(x, y)| self.grid_ref_viewport(x, y)) else {
@@ -1222,6 +1267,21 @@ mod tests {
     }
 
     #[test]
+    fn absolute_row_selection_spans_scrollback() {
+        let mut term = session();
+        for i in 0..30 {
+            term.write(format!("line {i}\r\n").as_bytes());
+        }
+        term.update_frame();
+        let total = term.scrollbar().total;
+        assert!(total > 10, "expected scrollback, got {total} rows");
+        term.select_row_range(total - 21, total - 12);
+        let text = term.selection_text().unwrap_or_default();
+        assert!(text.contains("line 10"), "{text:?}");
+        assert!(text.contains("line 18"), "{text:?}");
+    }
+
+    #[test]
     fn viewport_selection_extracts_text() {
         let mut term = session();
         term.write(b"alpha beta\r\ngamma delta");
@@ -1389,6 +1449,7 @@ mod tests {
             ffi::GHOSTTY_MODS_CTRL as u16,
             ffi::GHOSTTY_KEY_ACTION_PRESS,
             None,
+            None,
         );
         assert_eq!(bytes, b"\x03");
         let bytes = term.encode_key(
@@ -1396,8 +1457,29 @@ mod tests {
             0,
             ffi::GHOSTTY_KEY_ACTION_PRESS,
             None,
+            None,
         );
         assert_eq!(bytes, b"\x1b[A");
+    }
+
+    #[test]
+    fn kitty_protocol_keeps_ctrl_on_letter_keys() {
+        let mut term = session();
+        // Programs such as opencode enable Kitty's disambiguate flag. The
+        // encoder needs the unshifted codepoint to know Ctrl+P is a chord
+        // rather than plain text.
+        for flags in [1, 5] {
+            term.write(format!("\x1b[>{flags}u").as_bytes());
+            term.update_frame();
+            let bytes = term.encode_key(
+                ffi::GHOSTTY_KEY_P,
+                ffi::GHOSTTY_MODS_CTRL as u16,
+                ffi::GHOSTTY_KEY_ACTION_PRESS,
+                Some("p"),
+                Some('p'),
+            );
+            assert_eq!(bytes, b"\x1b[112;5u", "kitty flags {flags}");
+        }
     }
 
     #[test]
