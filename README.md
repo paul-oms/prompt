@@ -4,27 +4,22 @@
 
 # Prompt
 
-**Prompt is a macOS/Linux terminal for people who enjoy polished, beautiful software.**
+**Prompt is a macOS/Linux terminal that priorities user experience from the very first run.**
 
 > [!WARNING]
-> Prompt is **alpha software**. Expect rough edges, breaking changes and the
-> occasional crash. It is only for the brave right now.
+> Prompt is **alpha software**. It is only for the brave right now.
 
-The command line is a proper text editor, and works precisely how you would expect it to work: click anywhere, drag
-to select, copy and paste with the shortcuts you already know, complete with syntax
-highlighting, multiline commands, history search, background terminals, and tab completion.
+Here's what Prompt improves over other terminals:
+
+- The command line input works just like a text editor, with copy and paste, selectable text and easy editing
+- It has local AI built in (Qwen on Linux, Apple Foundation Models on MacOS 27+) to help you write commands and fix problems as you go
+- Features like history, background terminals, split panes and more are integrated and easy to find and use 
 
 It's written in Rust and based on [libghostty](https://github.com/ghostty-org/ghostty). **Rendering is
 GPU-accelerated** with [wgpu](https://wgpu.rs) and super fast.
 
-No configuration, no setup. It just works.
-
 ![Prompt demo: on-device command generation, GPU-accelerated rendering with wgpu, a 3D particle tunnel, split panes, a background tab and block view](docs/demo.gif)
 
-*The demo is painted live by Prompt's GPU path: the on-device model turns “run neon.py” into a runnable command, the
-user reviews and edits it, then the particle tunnel fills the pane. The composer docks, the pane splits, a live command
-is parked in the background panel, and block view opens beside it. The animation is [`scripts/neon.py`](scripts/neon.py);
-the title strip is part of the recording.*
 
 **Highlights**
 
@@ -35,13 +30,15 @@ the title strip is part of the recording.*
 
 ## Download
 
-Release builds support the two latest macOS versions on Apple Silicon:
+We have release builds for macOS:
 
 - [Prompt for macOS 26 (arm64)](https://github.com/paul-oms/prompt/releases/latest/download/Prompt-macos-26-arm64.dmg)
 - [Prompt for macOS 27 (arm64)](https://github.com/paul-oms/prompt/releases/latest/download/Prompt-macos-27-arm64.dmg)
 
 The DMGs are ad-hoc signed but not notarized yet. If macOS blocks the first
 launch, right-click **Prompt.app**, choose **Open**, then confirm.
+
+For linux, build from source and run with `cargo run`
 
 
 ## Install / run
