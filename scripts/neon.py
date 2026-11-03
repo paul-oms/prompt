@@ -10,15 +10,52 @@ Press Ctrl+C to stop it early.
 """
 
 import argparse
+import fcntl
 import math
+import os
 import random
-import shutil
+import struct
 import sys
+import termios
 import time
+
+# Fallback when the terminal does not report pixel dimensions. Monospace cells
+# are roughly twice as tall as they are wide.
+DEFAULT_CELL_ASPECT = 2.0
 
 
 def rgb(r, g, b):
     return f"\033[38;2;{int(r) % 256};{int(g) % 256};{int(b) % 256}m"
+
+
+def terminal_size():
+    """Current terminal size in cells, re-read every frame.
+
+    Terminals resize their PTY when a window or split changes, but a program
+    that only asks once keeps drawing the old grid and its output wraps.
+    """
+    try:
+        size = os.get_terminal_size(sys.stdout.fileno())
+        return size.columns, size.lines
+    except OSError:
+        return 80, 24
+
+
+def cell_aspect():
+    """Cell height divided by cell width, from the terminal's pixel size.
+
+    Prompt reports the PTY's pixel dimensions, so this stays correct when the
+    font, scale or split geometry changes. Returns a 2:1 fallback when the
+    terminal does not expose pixel sizes.
+    """
+    try:
+        packed = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b"\0" * 8)
+        rows, cols, xpixel, ypixel = struct.unpack("HHHH", packed)
+        if rows and cols and xpixel and ypixel:
+            return (ypixel / rows) / (xpixel / cols)
+    except (OSError, struct.error):
+        pass
+    return DEFAULT_CELL_ASPECT
 
 
 def main():
@@ -31,9 +68,10 @@ def main():
     )
     args = parser.parse_args()
 
-    width, height = shutil.get_terminal_size((80, 24))
-    width = max(20, width)
-    height = max(8, height - 1)
+    width, height = terminal_size()
+    width = max(1, width)
+    height = max(1, height - 1)
+    aspect = cell_aspect()
     particle_count = 2500
     particles = [
         [
@@ -45,9 +83,9 @@ def main():
         for _ in range(particle_count)
     ]
 
-    def project(x, y, z):
+    def project(x, y, z, width, height, aspect):
         f = height * 0.9 / (z + 0.1)
-        return int(width / 2 + x * f * 2), int(height / 2 + y * f)
+        return int(width / 2 + x * f * aspect), int(height / 2 + y * f)
 
     start = time.monotonic()
     frames = 0
@@ -60,6 +98,20 @@ def main():
             t = frame_start - start
             if args.seconds and t >= args.seconds:
                 break
+
+            # A split or window resize changes the PTY's grid underneath us.
+            # Follow it instead of drawing the old width into the new pane,
+            # which would wrap every line and scroll the frame.
+            new_width, new_height = terminal_size()
+            new_width = max(1, new_width)
+            new_height = max(1, new_height - 1)
+            if (new_width, new_height) != (width, height):
+                width, height = new_width, new_height
+                aspect = cell_aspect()
+                # Clear the reflowed/scrolled remains of the old frame.
+                out.write("\033[2J\033[H")
+            else:
+                out.write("\033[H")
 
             screen = [[" "] * width for _ in range(height)]
             colors = [[None] * width for _ in range(height)]
@@ -74,7 +126,7 @@ def main():
                         15,
                         random.uniform(0.5, 2),
                     ]
-                x, y = project(p[0], p[1], p[2])
+                x, y = project(p[0], p[1], p[2], width, height, aspect)
                 if 0 <= x < width and 0 <= y < height:
                     screen[y][x] = random.choice("✦◆◇*+×")
                     v = 1 - p[2] / 15
@@ -91,7 +143,7 @@ def main():
                         rz = x * math.sin(a) + z * math.cos(a)
                         ry = y * math.cos(b) - rz * math.sin(b)
                         rz = y * math.sin(b) + rz * math.cos(b)
-                        points.append(project(rx, ry, rz + 3))
+                        points.append(project(rx, ry, rz + 3, width, height, aspect))
 
             edges = [
                 (0, 1),
@@ -134,7 +186,7 @@ def main():
                     )
 
             # Render
-            lines = ["\033[H"]
+            lines = []
             for y in range(height):
                 for x in range(width):
                     color = colors[y][x]
@@ -147,10 +199,15 @@ def main():
             frames += 1
             elapsed = time.monotonic() - start
             fps = frames / max(elapsed, 0.001)
-            lines.append(
-                f"\033[1;97m  NEON CORE // FPS: {fps:.1f} // "
-                f"PARTICLES: {particle_count} // TIME: {elapsed:.1f}s\033[0m"
+            status = (
+                f"  NEON CORE // FPS: {fps:.1f} // "
+                f"PARTICLES: {particle_count} // TIME: {elapsed:.1f}s"
             )
+            # Keep the status line on one row; a wrapped status line would
+            # scroll the whole frame in a narrow split pane.
+            if len(status) > width:
+                status = f" NEON {fps:.0f}fps {particle_count}p {elapsed:.0f}s"
+            lines.append(f"\033[1;97m{status[:width]}\033[0m")
             out.write("".join(lines))
             out.flush()
 
