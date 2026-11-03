@@ -221,7 +221,7 @@ command generation on supported Macs.
 
 Implemented with a shared `CommandModel` path: macOS 27 uses the Swift
 Foundation Models bridge, while Linux and macOS 26 run a downloaded
-Qwen2.5-Coder 0.5B Q4 model through llama.cpp. `Cmd/Ctrl+G` (or
+Qwen2.5-Coder 1.5B Q4 model through llama.cpp. `Cmd/Ctrl+G` (or
 `Cmd/Ctrl+Enter`) replaces the composer text with a generated command for
 review; up to 30 lines; no auto-run. The model is fetched once and verified by
 SHA-256.

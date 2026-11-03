@@ -5,7 +5,7 @@
 //! instead. Both paths take the same request and return a single shell
 //! command, so the composer does not care which one answered.
 //!
-//! The model is deliberately tiny (Qwen2.5-Coder 0.5B, Q4) and lives in the
+//! The model is deliberately small (Qwen2.5-Coder 1.5B, Q4) and lives in the
 //! data directory. It is downloaded once, on first use, and then runs offline.
 //! Nothing here sends the user's command or output anywhere.
 
@@ -26,18 +26,22 @@ use llama_cpp_2::model::{LlamaChatMessage, LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use sha2::{Digest, Sha256};
 
-/// The default on-device model. 0.5B parameters is enough for "turn this
-/// sentence into a command"; the Q4 build is ~470 MB and runs on a CPU.
-pub const MODEL_FILE: &str = "qwen2.5-coder-0.5b-instruct-q4_k_m.gguf";
-pub const MODEL_URL: &str = "https://huggingface.co/Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-0.5b-instruct-q4_k_m.gguf";
-pub const MODEL_SHA256: &str = "1d9614638d18024d0fbb36575a15f1302a3adf044df10345688ec4f6e1c4ff32";
-pub const MODEL_BYTES: u64 = 491_400_064;
+/// The default on-device model. 1.5B is the smallest coder model that reliably
+/// handles flags, paths and multi-step commands; the Q4 build is ~1.1 GB and
+/// runs on a CPU. The previous 0.5B was faster but too weak for real prompts.
+pub const MODEL_FILE: &str = "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf";
+pub const MODEL_URL: &str = "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf";
+pub const MODEL_SHA256: &str = "cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046";
+pub const MODEL_BYTES: u64 = 1_117_320_768;
 
 /// Commands longer than this are truncated before they reach the composer.
 pub const MAX_LINES: usize = 30;
 
-const N_CTX: u32 = 4096;
-const N_BATCH: u32 = 512;
+// Enough for the system prompt, a long intent and a 30-line command. Keeping
+// this tight matters on laptops: the KV cache and compute buffer are the
+// difference between a snappy first command and swapping.
+const N_CTX: u32 = 2048;
+const N_BATCH: u32 = 256;
 const MAX_OUTPUT_TOKENS: usize = 1536;
 const MAX_INTENT_CHARS: usize = 2000;
 
@@ -47,10 +51,12 @@ Reply with the command only: no explanation, no markdown, no backticks, no leadi
 The directory line is the current working directory, so prefer relative paths. \
 Prefer the shortest correct command. \
 If a script is needed, use at most 30 lines. If the request is already a command, return it unchanged. \
+Use python3 to run .py files. \
 Examples:\n\
 list all files including hidden ones => ls -la\n\
 ssh into example.com as the deploy user => ssh deploy@example.com\n\
-find the biggest files here => du -ah . | sort -rh | head -20";
+find the biggest files here => du -ah . | sort -rh | head -20\n\
+run script.py => python3 script.py";
 
 #[derive(Clone, Debug)]
 pub struct Request {
@@ -167,6 +173,10 @@ fn worker(
         };
 
         send_done(&events, &notify, request.id, result, started, backend);
+        // A 1.5B Q4 model costs roughly 2 GB resident. Keep the terminal light
+        // between requests: reloading takes about a second, and the UI already
+        // shows "Loading Qwen model…" while it happens.
+        engine = None;
     }
 }
 
@@ -333,7 +343,7 @@ impl QwenEngine {
         }
         let mut params = LlamaModelParams::default();
         // On Apple Silicon llama.cpp ships with Metal; offload everything.
-        // Linux release builds are CPU-only, which is fine for 0.5B.
+        // Linux release builds are CPU-only, which is fine for 1.5B Q4.
         if cfg!(target_os = "macos") {
             params = params.with_n_gpu_layers(999);
         }
@@ -565,7 +575,7 @@ mod tests {
     }
 
     /// Downloads the real model and runs one generation. Ignored by default
-    /// because it needs ~470 MB and network access.
+    /// because it needs ~1.1 GB and network access.
     #[test]
     #[ignore]
     fn generates_a_command_end_to_end() {

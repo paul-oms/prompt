@@ -46,7 +46,7 @@ model=${DEMO_MODEL:-}
 if [ -z "$model" ]; then
     for candidate in \
         "$repo/target/demo-model.gguf" \
-        "$HOME/.local/share/prompt/models/qwen2.5-coder-0.5b-instruct-q4_k_m.gguf"; do
+        "$HOME/.local/share/prompt/models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"; do
         if [ -f "$candidate" ]; then
             model=$candidate
             break
@@ -62,7 +62,7 @@ if [ -z "$model" ]; then
     mkdir -p "$(dirname "$model")"
     echo "downloading the demo model to $model" >&2
     curl -L --fail --retry 3 -o "$model" \
-        "https://huggingface.co/Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-0.5b-instruct-q4_k_m.gguf"
+        "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"
 fi
 if [ ! -f "$model" ]; then
     echo "missing demo model: $model" >&2
@@ -139,24 +139,24 @@ sleep 0.45
 xdotool type --window "$wid" --delay 14 "$prompt"
 sleep 0.35
 # Ask the on-device model to turn the shorthand into a runnable command.
-xdotool key --window "$wid" ctrl+g
+xdotool key ctrl+g
 sleep 3.0
 # Review the result and add a runtime limit before running it.
 xdotool type --window "$wid" --delay 14 "$edit"
 sleep 0.35
-xdotool key --window "$wid" Return
+xdotool key Return
 sleep 3.0
-xdotool key --window "$wid" ctrl+shift+d
+xdotool key ctrl+shift+d
 sleep 0.9
 xdotool type --window "$wid" --delay 10 'while true; do date +%T; sleep 1; done'
 sleep 0.3
-xdotool key --window "$wid" Return
+xdotool key Return
 sleep 1.25
-xdotool key --window "$wid" ctrl+shift+m
+xdotool key ctrl+shift+m
 sleep 1.9
-xdotool key --window "$wid" ctrl+shift+Left
+xdotool key ctrl+shift+Left
 sleep 0.5
-xdotool key --window "$wid" ctrl+shift+b
+xdotool key ctrl+shift+b
 sleep 2.4
 
 wait "$ff_pid"

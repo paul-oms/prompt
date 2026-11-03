@@ -176,8 +176,8 @@ on-device backends as the rest of Prompt:
 - **macOS 27+ with Apple Intelligence** uses Apple's Foundation Models
   framework. There is no download, no API key and no network call. If Apple
   Intelligence is unavailable at runtime, Prompt falls back to Qwen.
-- **Linux and macOS 26** use a small Qwen2.5-Coder 0.5B model, quantised to
-  Q4. Prompt downloads it once, on first use (~470 MB), into
+- **Linux and macOS 26** use a small Qwen2.5-Coder 1.5B model, quantised to
+  Q4. Prompt downloads it once, on first use (~1.1 GB), into
   `~/.local/share/prompt/models/`, verifies its SHA-256 and then runs it
   locally with llama.cpp. Later generations work offline.
 

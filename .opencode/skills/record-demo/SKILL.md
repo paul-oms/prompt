@@ -39,7 +39,7 @@ DEMO_OUT=/tmp/demo.gif .opencode/skills/record-demo/scripts/record-demo.sh
 ```
 
 The recorder requires `Xvfb`, `xdotool`, `ffmpeg`, `python3`, and the release
-binary. It also needs the Qwen demo model: it reuses
+binary. It also needs the Qwen2.5-Coder 1.5B demo model (~1.1 GB): it reuses
 `target/demo-model.gguf` or the normal Prompt model cache, and downloads it to
 `target/demo-model.gguf` if neither exists. Override it with `DEMO_MODEL=...`.
 The recorder sets `PROMPT_CWD` to `scripts/`, so the generated
@@ -61,6 +61,8 @@ one.
   software, do not describe the recording as a GPU capture.
 - Captures the 1080x700 window with ffmpeg at 20fps, drives the UI with
   `xdotool`, then pads the capture to 1080x734 and overlays the title strip.
+- Focuses the window once and sends key presses through XTEST (`xdotool key`,
+  without `--window`). XSendEvent can block while the app is busy rendering.
 - Encodes at 900px wide, 12fps, 64 colours, `flags=area`, `dither=none`,
   `diff_mode=rectangle`. The particle field is dense; 1080px at 20fps produces
   a 7MB+ GIF, while these settings keep it around 2.7MB and still readable.
@@ -100,22 +102,22 @@ composer animation is visible):
 ```sh
 xdotool type --window "$wid" --delay 14 'run neon.py'
 sleep 0.35
-xdotool key --window "$wid" ctrl+g
+xdotool key ctrl+g
 sleep 3
 xdotool type --window "$wid" --delay 14 ' --seconds 30'
 sleep 0.35
-xdotool key --window "$wid" Return
+xdotool key Return
 sleep 3
-xdotool key --window "$wid" ctrl+shift+d
+xdotool key ctrl+shift+d
 sleep 0.9
 xdotool type --window "$wid" --delay 10 'while true; do date +%T; sleep 1; done'
-xdotool key --window "$wid" Return
+xdotool key Return
 sleep 1.25
-xdotool key --window "$wid" ctrl+shift+m
+xdotool key ctrl+shift+m
 sleep 1.9
-xdotool key --window "$wid" ctrl+shift+Left
+xdotool key ctrl+shift+Left
 sleep 0.5
-xdotool key --window "$wid" ctrl+shift+b
+xdotool key ctrl+shift+b
 sleep 2.4
 ```
 
