@@ -6,6 +6,7 @@ mod editor;
 mod ffi;
 mod font;
 mod gpu;
+mod hardware;
 mod highlight;
 mod history;
 mod keys;

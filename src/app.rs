@@ -21,6 +21,7 @@ use crate::config::{self, Config, Paths};
 use crate::editor::Editor;
 use crate::font::{Clip, Span, TextEngine};
 use crate::gpu::{GlyphAtlas, Renderer};
+use crate::hardware::Hardware;
 use crate::highlight;
 use crate::history::History;
 use crate::keys;
@@ -262,6 +263,17 @@ struct SearchState {
     query: String,
     selected: usize,
     matches: Vec<String>,
+}
+
+/// First-run model choice. The list is already filtered to models that fit the
+/// machine; `resume` remembers whether Ctrl+G should start generating once the
+/// user picks one.
+struct ModelPicker {
+    options: Vec<&'static model::ModelSpec>,
+    selected: usize,
+    recommended: usize,
+    summary: String,
+    resume: bool,
 }
 
 struct CompletionState {
@@ -526,6 +538,10 @@ pub struct PromptApp {
     model: model::Client,
     generation: Option<Generation>,
     next_generation: u64,
+    /// The Qwen file to use on Linux and macOS 26. `None` means the picker has
+    /// not run yet; macOS 27 uses Foundation Models and ignores this.
+    model_choice: Option<&'static model::ModelSpec>,
+    model_picker: Option<ModelPicker>,
 
     mode: Mode,
     focus: Focus,
@@ -593,6 +609,7 @@ impl PromptApp {
         let theme = Theme::default();
         let launch = shell::prepare(&paths, &config);
         let history = History::load(paths.history_file(), 5000);
+        let model_choice = model::resolve_choice(&paths.models_dir(), &config.ai.model);
         let model_notify_proxy = proxy.clone();
         let model = model::Client::spawn(
             paths.models_dir(),
@@ -689,6 +706,8 @@ impl PromptApp {
             model,
             generation: None,
             next_generation: 1,
+            model_choice,
+            model_picker: None,
             mode: if launch_integrated {
                 Mode::Compose
             } else {
@@ -3250,6 +3269,16 @@ impl PromptApp {
             {
                 return;
             }
+            // The model picker is modal. It exists only on Linux and macOS 26;
+            // macOS 27 always uses Foundation Models.
+            if self.model_picker.is_some() {
+                self.handle_model_picker_key(code);
+                return;
+            }
+            if primary && shift && code == KeyCode::KeyG {
+                self.open_model_picker(false);
+                return;
+            }
             // Splits. `Ctrl/Cmd+Shift+D` divides side by side; `E` stacks.
             if primary && shift && code == KeyCode::KeyD {
                 self.split_active(SplitAxis::Vertical);
@@ -3782,6 +3811,155 @@ impl PromptApp {
             return;
         }
 
+        // macOS 27 ships the model with the OS. Do not ask the user to pick or
+        // download anything there.
+        if self.model.is_apple_fm() || crate::hardware::is_macos_27() {
+            self.start_generation(model::default_spec());
+            return;
+        }
+        // An explicit model file means the user already made the choice.
+        if std::env::var_os("PROMPT_MODEL_PATH").is_some() {
+            let spec = self.model_choice.unwrap_or_else(model::default_spec);
+            self.start_generation(spec);
+            return;
+        }
+        if let Some(spec) = self.model_choice {
+            self.start_generation(spec);
+            return;
+        }
+
+        self.open_model_picker(true);
+    }
+
+    /// Show the models that fit, or choose the only possible one automatically.
+    fn open_model_picker(&mut self, resume: bool) {
+        if self.model.is_apple_fm() || crate::hardware::is_macos_27() {
+            self.toast("macOS 27 handles commands with Foundation Models — no model to choose");
+            return;
+        }
+        let gpu = self
+            .gpu
+            .as_ref()
+            .map(|renderer| renderer.adapter_name().to_string());
+        let hardware = Hardware::detect(gpu);
+        let options = model::options_for(hardware.ram_bytes);
+        let recommended = model::recommended_for(hardware.ram_bytes);
+        let recommended_index = options
+            .iter()
+            .position(|spec| spec.id == recommended.id)
+            .unwrap_or(0);
+        // Reopening the picker should highlight the current choice when it is
+        // still one of the offered models.
+        let selected = self
+            .model_choice
+            .and_then(|current| options.iter().position(|spec| spec.id == current.id))
+            .unwrap_or(recommended_index);
+
+        if options.len() <= 1 {
+            let spec = options.first().copied().unwrap_or_else(model::default_spec);
+            self.remember_model(spec);
+            self.toast(format!(
+                "Using {} — {} only has room for the smallest model",
+                spec.name,
+                hardware.summary()
+            ));
+            if resume {
+                self.start_generation(spec);
+            }
+            return;
+        }
+
+        self.model_picker = Some(ModelPicker {
+            options,
+            selected,
+            recommended: recommended_index,
+            summary: hardware.summary(),
+            resume,
+        });
+        self.request_redraw();
+    }
+
+    fn remember_model(&mut self, spec: &'static model::ModelSpec) {
+        self.model_choice = Some(spec);
+        if let Err(err) = model::save_choice(&self.paths.models_dir(), spec.id) {
+            eprintln!("prompt: {err}");
+        }
+    }
+
+    fn choose_model(&mut self, index: usize) {
+        let Some(picker) = &self.model_picker else {
+            return;
+        };
+        let Some(spec) = picker.options.get(index).copied() else {
+            return;
+        };
+        let resume = picker.resume;
+        self.model_picker = None;
+        self.remember_model(spec);
+        if resume {
+            self.start_generation(spec);
+        } else {
+            self.toast(format!("Command model: {}", spec.name));
+        }
+    }
+
+    fn handle_model_picker_key(&mut self, code: KeyCode) -> bool {
+        let Some(picker) = &self.model_picker else {
+            return false;
+        };
+        let mut selected = picker.selected;
+        let len = picker.options.len();
+        match code {
+            KeyCode::Escape => {
+                self.model_picker = None;
+                self.request_redraw();
+                return true;
+            }
+            KeyCode::ArrowUp => {
+                selected = selected.saturating_sub(1);
+            }
+            KeyCode::ArrowDown => {
+                if selected + 1 < len {
+                    selected += 1;
+                }
+            }
+            KeyCode::Enter | KeyCode::NumpadEnter => {
+                self.choose_model(selected);
+                return true;
+            }
+            KeyCode::Digit1 | KeyCode::Digit2 | KeyCode::Digit3 | KeyCode::Digit4 => {
+                let index = match code {
+                    KeyCode::Digit1 => 0,
+                    KeyCode::Digit2 => 1,
+                    KeyCode::Digit3 => 2,
+                    _ => 3,
+                };
+                if index < len {
+                    self.choose_model(index);
+                }
+                return true;
+            }
+            _ => {}
+        }
+        if let Some(picker) = &mut self.model_picker {
+            picker.selected = selected;
+        }
+        self.request_redraw();
+        // The picker owns the keyboard: typed text must not leak into the
+        // composer behind it.
+        true
+    }
+
+    fn start_generation(&mut self, spec: &'static model::ModelSpec) {
+        if self.generation.is_some() {
+            return;
+        }
+        let intent = self.editor.text().trim().to_string();
+        if intent.is_empty() {
+            self.toast("Type what you want to do first");
+            return;
+        }
+
         let id = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1);
         let cancel = Arc::new(AtomicBool::new(false));
@@ -3797,13 +3975,18 @@ impl PromptApp {
             intent,
             shell: self.launch.kind.name().to_string(),
             cwd,
+            model: spec,
             cancel: cancel.clone(),
         });
         self.generation = Some(Generation {
             id,
             started: Instant::now(),
             backend,
-            status: "Preparing command model…".into(),
+            status: if self.model.is_apple_fm() {
+                "Preparing command model…".into()
+            } else {
+                format!("Preparing {}…", spec.name)
+            },
             cancel,
         });
         self.focus = Focus::Composer;
@@ -4376,6 +4559,13 @@ impl PromptApp {
             // A click outside a popup is a dismissal in every editor.
             self.completion_popup = None;
             self.search = None;
+        }
+        if self.model_picker.is_some() {
+            if state == ElementState::Pressed {
+                self.model_picker = None;
+                self.request_redraw();
+            }
+            return;
         }
         if state == ElementState::Released && self.drag_divider.take().is_some() {
             return;
@@ -5030,6 +5220,7 @@ impl PromptApp {
         self.draw_welcome();
         self.draw_search();
         self.draw_completion();
+        self.draw_model_picker();
         self.draw_toast();
 
         // Present.
@@ -6695,6 +6886,141 @@ impl PromptApp {
                 w - pad * 2.0,
             );
         }
+    }
+
+    fn draw_model_picker(&mut self) {
+        let Some(picker) = &self.model_picker else {
+            return;
+        };
+        let options = picker.options.clone();
+        let selected = picker.selected;
+        let recommended = picker.recommended;
+        let summary = picker.summary.clone();
+        let resume = picker.resume;
+        let Some(canvas) = self.canvas.as_mut() else {
+            return;
+        };
+        let cell_h = self.text.cell_h;
+        let card = self.card;
+        let scale = self.scale;
+        let theme = self.theme.clone();
+        let w = (card.w * 0.86).min(820.0 * scale).max(360.0 * scale);
+        let x = card.x + 24.0 * scale;
+        let pad = 14.0 * scale;
+        let row_h = cell_h + 8.0 * scale;
+        let header_h = cell_h * 2.0 + 10.0 * scale;
+        let footer_h = cell_h;
+        let h = pad * 2.0 + header_h + options.len() as f32 * row_h + 6.0 * scale + footer_h;
+        let y = (card.y - h - 10.0 * scale).max(self.grid.y + 4.0 * scale);
+        let mut painter = Painter {
+            canvas,
+            text: &mut self.text,
+            scale: self.scale,
+        };
+        painter.rounded(x, y + 5.0 * scale, w, h, 10.0 * scale, theme.shadow, 0.5);
+        painter.rounded(x, y, w, h, 10.0 * scale, theme.panel, 1.0);
+        painter.rounded_stroke(x, y, w, h, 10.0 * scale, scale, theme.border, 0.9);
+        let clip = Clip::new(x, y, w, h);
+        painter.text(
+            x + pad,
+            y + pad,
+            "Choose a command model",
+            theme.accent,
+            true,
+            None,
+            clip,
+            w - pad * 2.0,
+        );
+        painter.text(
+            x + pad,
+            y + pad + cell_h + 4.0 * scale,
+            &format!("Detected {summary}"),
+            theme.dim,
+            false,
+            None,
+            clip,
+            w - pad * 2.0,
+        );
+
+        let rows_y = y + pad + header_h;
+        for (index, spec) in options.iter().enumerate() {
+            let ry = rows_y + index as f32 * row_h;
+            if index == selected {
+                painter.rounded(
+                    x + pad * 0.5,
+                    ry - 1.0 * scale,
+                    w - pad,
+                    row_h,
+                    5.0 * scale,
+                    theme.accent,
+                    0.18,
+                );
+            }
+            let color = if index == selected {
+                theme.fg
+            } else {
+                theme.dim
+            };
+            let detail = format!(
+                "   {}  ·  {}{}",
+                spec.size_label(),
+                spec.note,
+                if index == recommended {
+                    "  ·  recommended"
+                } else {
+                    ""
+                }
+            );
+            let number = format!("{}.  ", index + 1);
+            let spans = [
+                Span {
+                    text: number,
+                    color: theme.faint,
+                    bold: false,
+                    italic: false,
+                },
+                Span {
+                    text: spec.name.to_string(),
+                    color,
+                    bold: true,
+                    italic: false,
+                },
+                Span {
+                    text: detail,
+                    color: if index == selected {
+                        theme.dim
+                    } else {
+                        theme.faint
+                    },
+                    bold: false,
+                    italic: false,
+                },
+            ];
+            painter.spans(
+                x + pad,
+                ry + (row_h - cell_h) / 2.0,
+                &spans,
+                None,
+                clip,
+                w - pad * 2.0,
+            );
+        }
+
+        let hint = if resume {
+            "↑↓ choose  ·  enter download  ·  esc cancel"
+        } else {
+            "↑↓ choose  ·  enter select  ·  esc cancel"
+        };
+        painter.text(
+            x + pad,
+            rows_y + options.len() as f32 * row_h + 6.0 * scale,
+            hint,
+            theme.faint,
+            false,
+            None,
+            clip,
+            w - pad * 2.0,
+        );
     }
 
     fn draw_completion(&mut self) {

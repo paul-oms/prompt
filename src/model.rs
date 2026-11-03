@@ -5,9 +5,11 @@
 //! instead. Both paths take the same request and return a single shell
 //! command, so the composer does not care which one answered.
 //!
-//! The model is deliberately small (Qwen2.5-Coder 1.5B, Q4) and lives in the
-//! data directory. It is downloaded once, on first use, and then runs offline.
-//! Nothing here sends the user's command or output anywhere.
+//! Prompt offers a few Qwen sizes, all Q4, and picks the ones that fit the
+//! machine. The 1.5B model is the lightweight default; larger machines can
+//! choose 3B, 7B or 14B for better commands. The selected file lives in the
+//! data directory, is downloaded once, and then runs offline. Nothing here
+//! sends the user's command or output anywhere.
 
 use std::io::{Read, Write};
 use std::num::NonZeroU32;
@@ -26,13 +28,151 @@ use llama_cpp_2::model::{LlamaChatMessage, LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use sha2::{Digest, Sha256};
 
-/// The default on-device model. 1.5B is the smallest coder model that reliably
-/// handles flags, paths and multi-step commands; the Q4 build is ~1.1 GB and
-/// runs on a CPU. The previous 0.5B was faster but too weak for real prompts.
-pub const MODEL_FILE: &str = "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf";
-pub const MODEL_URL: &str = "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf";
-pub const MODEL_SHA256: &str = "cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046";
-pub const MODEL_BYTES: u64 = 1_117_320_768;
+/// One downloadable Qwen model. Q4_K_M keeps the files small enough to run on
+/// a laptop while staying accurate enough for shell commands.
+#[derive(Clone, Copy, Debug)]
+pub struct ModelSpec {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub file: &'static str,
+    pub url: &'static str,
+    pub sha256: &'static str,
+    pub bytes: u64,
+    /// Total system RAM needed before this model is offered.
+    pub min_ram: u64,
+    /// RAM needed for this model to be the recommended default rather than
+    /// merely possible.
+    pub recommended_ram: u64,
+    /// Short description for the picker.
+    pub note: &'static str,
+}
+
+impl ModelSpec {
+    pub fn size_label(&self) -> String {
+        format!("{:.1} GB", self.bytes as f64 / 1_000_000_000.0)
+    }
+}
+
+/// Ordered smallest to largest. The first entry is always offered, even on a
+/// machine below its minimum, so there is never an empty picker.
+pub const MODELS: &[ModelSpec] = &[
+    ModelSpec {
+        id: "qwen2.5-coder-1.5b",
+        name: "Qwen2.5-Coder 1.5B",
+        file: "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+        url: "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+        sha256: "cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046",
+        bytes: 1_117_320_768,
+        min_ram: 4 * GIB,
+        recommended_ram: 4 * GIB,
+        note: "fastest, lightest",
+    },
+    ModelSpec {
+        id: "qwen2.5-coder-3b",
+        name: "Qwen2.5-Coder 3B",
+        file: "qwen2.5-coder-3b-instruct-q4_k_m.gguf",
+        url: "https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct-GGUF/resolve/main/qwen2.5-coder-3b-instruct-q4_k_m.gguf",
+        sha256: "724fb256bec1ff062b2f65e4569e871ad2e95ab2a3989723d1769c54294730b7",
+        bytes: 2_104_932_800,
+        min_ram: 6 * GIB,
+        recommended_ram: 8 * GIB,
+        note: "balanced",
+    },
+    ModelSpec {
+        id: "qwen2.5-coder-7b",
+        name: "Qwen2.5-Coder 7B",
+        file: "qwen2.5-coder-7b-instruct-q4_k_m.gguf",
+        url: "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf",
+        sha256: "509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c",
+        bytes: 4_683_073_536,
+        min_ram: 10 * GIB,
+        recommended_ram: 12 * GIB,
+        note: "better multi-step",
+    },
+    ModelSpec {
+        id: "qwen2.5-coder-14b",
+        name: "Qwen2.5-Coder 14B",
+        file: "qwen2.5-coder-14b-instruct-q4_k_m.gguf",
+        url: "https://huggingface.co/Qwen/Qwen2.5-Coder-14B-Instruct-GGUF/resolve/main/qwen2.5-coder-14b-instruct-q4_k_m.gguf",
+        sha256: "c1e659736d89ac1065fb495330fb824d94001974a4bfa78e7270e43476a8d940",
+        bytes: 8_988_110_272,
+        min_ram: 16 * GIB,
+        recommended_ram: 24 * GIB,
+        note: "best commands",
+    },
+];
+
+const GIB: u64 = 1_073_741_824;
+const SELECTION_FILE: &str = "selected-model";
+
+/// The model Prompt has always shipped: the safe choice for every machine.
+pub fn default_spec() -> &'static ModelSpec {
+    &MODELS[0]
+}
+
+pub fn find(id: &str) -> Option<&'static ModelSpec> {
+    MODELS.iter().find(|spec| spec.id == id)
+}
+
+/// Models worth showing on a machine with `ram_bytes` of memory. The default
+/// model is always first; larger models only appear when they fit.
+pub fn options_for(ram_bytes: u64) -> Vec<&'static ModelSpec> {
+    MODELS
+        .iter()
+        .enumerate()
+        .filter(|(index, spec)| *index == 0 || ram_bytes >= spec.min_ram)
+        .map(|(_, spec)| spec)
+        .collect()
+}
+
+/// The largest model that fits with comfortable headroom. On a machine where
+/// only the default fits, this is the default.
+pub fn recommended_for(ram_bytes: u64) -> &'static ModelSpec {
+    let options = options_for(ram_bytes);
+    options
+        .iter()
+        .rev()
+        .find(|spec| ram_bytes >= spec.recommended_ram)
+        .copied()
+        .unwrap_or_else(|| options.last().copied().unwrap_or_else(default_spec))
+}
+
+/// Resolution order: `PROMPT_MODEL`, then `[ai] model` in config.toml, then the
+/// choice saved by the picker. `None` means ask on the next Ctrl+G.
+pub fn resolve_choice(models_dir: &Path, configured: &str) -> Option<&'static ModelSpec> {
+    if let Ok(id) = std::env::var("PROMPT_MODEL") {
+        if let Some(spec) = find(id.trim()) {
+            return Some(spec);
+        }
+        eprintln!("prompt: PROMPT_MODEL is not a known model id: {id}");
+    }
+    let configured = configured.trim();
+    if !configured.is_empty() {
+        if let Some(spec) = find(configured) {
+            return Some(spec);
+        }
+        eprintln!("prompt: [ai] model is not a known model id: {configured}");
+    }
+    if let Ok(id) = std::fs::read_to_string(models_dir.join(SELECTION_FILE)) {
+        if let Some(spec) = find(id.trim()) {
+            return Some(spec);
+        }
+    }
+    // Upgrade path: older versions always downloaded the 1.5B file without
+    // recording a choice (and the demo recorder prepares it directly). Do not
+    // ask again when that file is already there.
+    if models_dir.join(default_spec().file).is_file() {
+        return Some(default_spec());
+    }
+    None
+}
+
+pub fn save_choice(models_dir: &Path, id: &str) -> Result<(), String> {
+    std::fs::create_dir_all(models_dir)
+        .map_err(|err| format!("could not create model directory: {err}"))?;
+    std::fs::write(models_dir.join(SELECTION_FILE), format!("{id}\n"))
+        .map_err(|err| format!("could not remember the model choice: {err}"))
+}
 
 /// Commands longer than this are truncated before they reach the composer.
 pub const MAX_LINES: usize = 30;
@@ -64,6 +204,9 @@ pub struct Request {
     pub intent: String,
     pub shell: String,
     pub cwd: String,
+    /// The GGUF model to use for this request. Ignored by Apple Foundation
+    /// Models, which are built into the OS.
+    pub model: &'static ModelSpec,
     pub cancel: Arc<AtomicBool>,
 }
 
@@ -107,6 +250,12 @@ impl Client {
         self.backend
     }
 
+    /// True when the OS model handles commands; there is nothing to choose or
+    /// download on these Macs.
+    pub fn is_apple_fm(&self) -> bool {
+        self.backend == "Apple Foundation Models"
+    }
+
     pub fn request(&self, request: Request) {
         let _ = self.tx.send(request);
     }
@@ -147,16 +296,22 @@ fn worker(
                 crate::apple_fm::generate(&prompt).and_then(|text| sanitize(&text))
             }
             _ => {
+                let spec = request.model;
                 if engine.is_none() {
-                    let path = model_path(&models_dir);
-                    if let Err(err) = ensure_model(&path, &request, &events, &notify) {
+                    let path = model_path(&models_dir, spec);
+                    if let Err(err) = ensure_model(&path, spec, &request, &events, &notify) {
                         send_done(&events, &notify, request.id, Err(err), started, backend);
                         continue;
                     }
                     if request.cancel.load(Ordering::Relaxed) {
                         continue;
                     }
-                    status(&events, &notify, request.id, "Loading Qwen model…".into());
+                    status(
+                        &events,
+                        &notify,
+                        request.id,
+                        format!("Loading {}…", spec.name),
+                    );
                     match QwenEngine::load(&path) {
                         Ok(loaded) => engine = Some(loaded),
                         Err(err) => {
@@ -173,9 +328,9 @@ fn worker(
         };
 
         send_done(&events, &notify, request.id, result, started, backend);
-        // A 1.5B Q4 model costs roughly 2 GB resident. Keep the terminal light
-        // between requests: reloading takes about a second, and the UI already
-        // shows "Loading Qwen model…" while it happens.
+        // A model costs more memory than the terminal itself, especially on a
+        // large machine. Keep the terminal light between requests: reloading
+        // takes a moment and the UI already shows a loading status.
         engine = None;
     }
 }
@@ -202,20 +357,21 @@ fn status(events: &Sender<Event>, notify: &(dyn Fn() + Send + Sync), id: u64, te
     notify();
 }
 
-fn model_path(models_dir: &Path) -> PathBuf {
+fn model_path(models_dir: &Path, spec: &ModelSpec) -> PathBuf {
     if let Some(path) = std::env::var_os("PROMPT_MODEL_PATH") {
         return PathBuf::from(path);
     }
-    models_dir.join(MODEL_FILE)
+    models_dir.join(spec.file)
 }
 
-fn model_url() -> String {
-    std::env::var("PROMPT_MODEL_URL").unwrap_or_else(|_| MODEL_URL.to_string())
+fn model_url(spec: &ModelSpec) -> String {
+    std::env::var("PROMPT_MODEL_URL").unwrap_or_else(|_| spec.url.to_string())
 }
 
 /// Download the model if it is not already cached, then verify its checksum.
 fn ensure_model(
     path: &Path,
+    spec: &ModelSpec,
     request: &Request,
     events: &Sender<Event>,
     notify: &(dyn Fn() + Send + Sync),
@@ -235,7 +391,7 @@ fn ensure_model(
             }
             return Err(format!("the model at {} is empty", path.display()));
         }
-        if size == MODEL_BYTES {
+        if size == spec.bytes {
             return Ok(());
         }
         let _ = std::fs::remove_file(path);
@@ -247,12 +403,12 @@ fn ensure_model(
         ));
     }
 
-    let url = model_url();
+    let url = model_url(spec);
     status(
         events,
         notify,
         id,
-        format!("Downloading Qwen model ({} MB)…", MODEL_BYTES / 1_000_000),
+        format!("Downloading {} ({} GB)…", spec.name, spec.size_label()),
     );
 
     let part = path.with_extension("part");
@@ -260,7 +416,7 @@ fn ensure_model(
     let mut response = ureq::get(&url)
         .call()
         .map_err(|err| format!("could not download the model: {err}"))?;
-    let total = response.body().content_length().unwrap_or(MODEL_BYTES);
+    let total = response.body().content_length().unwrap_or(spec.bytes);
     let mut reader = response.body_mut().as_reader();
     let mut file =
         std::fs::File::create(&part).map_err(|err| format!("could not write the model: {err}"))?;
@@ -295,7 +451,7 @@ fn ensure_model(
                 events,
                 notify,
                 id,
-                format!("Downloading Qwen model… {pct}%"),
+                format!("Downloading {}… {pct}%", spec.name),
             );
             last_status = Instant::now();
         }
@@ -311,7 +467,7 @@ fn ensure_model(
     }
 
     let digest = hex(&hasher.finalize());
-    if digest != MODEL_SHA256 {
+    if digest != spec.sha256 {
         let _ = std::fs::remove_file(&part);
         return Err("the downloaded model failed its checksum".into());
     }
@@ -598,6 +754,7 @@ mod tests {
                 intent: intent.into(),
                 shell: "zsh".into(),
                 cwd: "/tmp".into(),
+                model: default_spec(),
                 cancel: Arc::new(AtomicBool::new(false)),
             });
             let deadline = Instant::now() + Duration::from_secs(900);
@@ -627,11 +784,55 @@ mod tests {
             intent: "ssh into the deploy box".into(),
             shell: "zsh".into(),
             cwd: "/srv/app".into(),
+            model: default_spec(),
             cancel: Arc::new(AtomicBool::new(false)),
         };
         let prompt = build_prompt(&request);
         assert!(prompt.contains("shell: zsh"));
         assert!(prompt.contains("directory: /srv/app"));
         assert!(prompt.contains("ssh into the deploy box"));
+    }
+
+    #[test]
+    fn model_catalog_is_ordered_and_unique() {
+        assert_eq!(default_spec().id, "qwen2.5-coder-1.5b");
+        for (index, spec) in MODELS.iter().enumerate() {
+            assert!(spec.bytes > 0);
+            assert_eq!(spec.sha256.len(), 64);
+            assert!(spec.url.ends_with(spec.file));
+            assert!(!MODELS[..index].iter().any(|other| other.id == spec.id));
+            assert!(!MODELS[..index].iter().any(|other| other.file == spec.file));
+            if index > 0 {
+                assert!(spec.bytes > MODELS[index - 1].bytes);
+                assert!(spec.min_ram >= MODELS[index - 1].min_ram);
+            }
+        }
+    }
+
+    #[test]
+    fn small_machines_only_get_the_default() {
+        let options = options_for(2 * GIB);
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].id, default_spec().id);
+        assert_eq!(recommended_for(2 * GIB).id, default_spec().id);
+    }
+
+    #[test]
+    fn options_grow_with_memory() {
+        assert_eq!(options_for(8 * GIB).len(), 2);
+        assert_eq!(options_for(12 * GIB).len(), 3);
+        assert_eq!(options_for(16 * GIB).len(), 4);
+        assert_eq!(options_for(64 * GIB).len(), MODELS.len());
+    }
+
+    #[test]
+    fn recommendation_leaves_headroom() {
+        assert_eq!(recommended_for(8 * GIB).id, "qwen2.5-coder-3b");
+        assert_eq!(recommended_for(16 * GIB).id, "qwen2.5-coder-7b");
+        assert_eq!(recommended_for(32 * GIB).id, "qwen2.5-coder-14b");
+        // A model that only just fits is offered but not recommended.
+        assert!(options_for(16 * GIB)
+            .iter()
+            .any(|spec| spec.id == "qwen2.5-coder-14b"));
     }
 }

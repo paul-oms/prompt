@@ -266,6 +266,7 @@ pub struct Renderer {
     uniform_buffer: wgpu::Buffer,
     vertex_buffer: wgpu::Buffer,
     vertex_capacity: usize,
+    adapter_name: String,
 }
 
 impl Renderer {
@@ -500,6 +501,7 @@ impl Renderer {
             uniform_buffer: uniform,
             vertex_buffer,
             vertex_capacity,
+            adapter_name: info.name.clone(),
         };
         renderer.upload_uniforms();
         eprintln!(
@@ -511,6 +513,12 @@ impl Renderer {
 
     pub fn atlas(&self) -> Rc<RefCell<GlyphAtlas>> {
         self.atlas.clone()
+    }
+
+    /// The wgpu adapter's display name, used to describe the machine when
+    /// choosing a command model.
+    pub fn adapter_name(&self) -> &str {
+        &self.adapter_name
     }
 
     fn upload_uniforms(&mut self) {

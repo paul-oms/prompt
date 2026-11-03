@@ -11,6 +11,7 @@ pub struct Config {
     pub behavior: Behavior,
     pub ui: Ui,
     pub render: Render,
+    pub ai: Ai,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -94,6 +95,22 @@ impl Default for Render {
     }
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct Ai {
+    /// Force a command model by id. Empty means remember the picker's choice,
+    /// or ask on first use.
+    pub model: String,
+}
+
+impl Default for Ai {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Paths {
     pub config_dir: PathBuf,
@@ -172,6 +189,11 @@ window_height = 700
 [render]
 # auto (GPU when available), gpu, or cpu.
 backend = "auto"
+
+[ai]
+# Command model for Linux and macOS 26. Empty = ask on first use, then remember.
+# qwen2.5-coder-1.5b, qwen2.5-coder-3b, qwen2.5-coder-7b, qwen2.5-coder-14b
+model = ""
 "#;
 
 /// Load config, creating the config directory and a commented default file on
@@ -224,6 +246,7 @@ fn sanitize(mut cfg: Config) -> Config {
         "cpu" => "cpu".into(),
         _ => "auto".into(),
     };
+    cfg.ai.model = cfg.ai.model.trim().to_string();
     cfg
 }
 
