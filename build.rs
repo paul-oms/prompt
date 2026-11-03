@@ -92,8 +92,10 @@ fn build_foundation_models(manifest: &Path) {
                 .join("System/Library/Frameworks/FoundationModels.framework")
                 .exists()
             {
-                println!("cargo:rustc-link-arg=-Wl,-weak_framework");
-                println!("cargo:rustc-link-arg=FoundationModels");
+                // Keep the linker flag and framework name in one argument.
+                // Passing `FoundationModels` as a second `rustc-link-arg`
+                // makes clang treat it as an input file on macOS CI.
+                println!("cargo:rustc-link-arg=-Wl,-weak_framework,FoundationModels");
             }
         }
         return;

@@ -54,8 +54,8 @@ matter more than the number.
   range, exit status, cwd, start time and duration; `Ctrl+Shift+B` opens block
   view with `[`/`]`, a 300-line lazy reader, `/` search, `e` expand, `n`/`N`
   match navigation, and copy-command/copy-output/select/rerun/edit actions
-  (also clickable in the block bar). Long finished blocks fold in the normal
-  grid behind a "N lines hidden" marker.
+  (also clickable in the block bar). Long finished blocks can be folded in the
+  normal grid behind a "N lines hidden" marker.
 - **Detachable background tabs** (0.0.3–0.0.7): `Ctrl+Shift+M` (formerly
   `Ctrl+Shift+D`) parks the running tab in the right-hand panel with a live
   output preview, running timer, exit status, scrollable list,
@@ -124,9 +124,10 @@ and metadata layer is now in place.
   `E`, `c`, `y`, `v`; also clickable in the block bar)
 - cwd, start time and duration live in the block model and the block bar shows
   the command at the top of the block, plus directory, duration and status
-- finished blocks longer than 300 lines fold their middle in the normal grid to
-  a clickable “N lines hidden” row, keeping the command and output tail;
-  block view's `e` still expands the lazy reader
+- long finished blocks can fold their middle in the normal grid to a clickable
+  “N lines hidden” row, keeping the command and output tail; folding is
+  explicit so scrolling back never hides text, and block view's `e` still
+  expands the lazy reader
 - output selection uses absolute scrollback rows from the block model, and
   actions refuse to run against full-screen programs
 

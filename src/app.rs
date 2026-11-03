@@ -7751,12 +7751,9 @@ fn close_open_block(blocks: &mut [Block], session: &mut TerminalSession, status:
     block.end_row = Some(row.max(block.start_row));
     block.status = status;
     block.duration = Some(block.started.elapsed());
-    // Long output stays readable in the normal grid: keep the command, a little
-    // leading context and the tail, and fold the middle behind a one-line
-    // marker. `e` in block view and the marker's click action can expand it.
-    if block.end_row.unwrap_or(0).saturating_sub(block.start_row) + 1 > BLOCK_WINDOW {
-        block.collapsed = true;
-    }
+    // Keep output expanded by default. Folding is explicit through the block
+    // bar so scrolling back through a finished command never hides text the
+    // user is looking for.
 }
 
 /// Last useful output line for the background panel. A running command shows

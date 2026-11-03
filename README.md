@@ -159,8 +159,9 @@ In block view: `[`/`]` moves between blocks, `g`/`G` snaps to the top or
 bottom, `e` expands a long block, `/` searches inside it, `n`/`N` walks the
 matches, and `Esc` returns to the terminal. The block bar also has clickable
 actions: copy the command (`c`), copy the output (`y`), select the output
-(`v`), rerun it (`r`), or edit it first (`E`). Finished blocks longer than 300
-lines fold in the normal grid; the "N lines hidden" row expands them again.
+(`v`), rerun it (`r`), or edit it first (`E`). Long blocks can be folded from
+the block bar; the "N lines hidden" row expands them again. Output stays
+expanded by default, so scrolling back through a command never hides text.
 The block bar shows the command at the top of the block, plus its directory,
 duration and exit status; a folded block's marker repeats the command.
 
