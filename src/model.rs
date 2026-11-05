@@ -5,11 +5,11 @@
 //! instead. Both paths take the same request and return a single shell
 //! command, so the composer does not care which one answered.
 //!
-//! Prompt offers a few Qwen sizes, all Q4, and picks the ones that fit the
-//! machine. The 1.5B model is the lightweight default; larger machines can
-//! choose 3B, 7B or 14B for better commands. The selected file lives in the
-//! data directory, is downloaded once, and then runs offline. Nothing here
-//! sends the user's command or output anywhere.
+//! Prompt offers a few current Qwen 3.5 sizes plus MiniCPM5-2B, all Q4, and
+//! picks the ones that fit the machine. The 0.8B model is the lightweight
+//! base; larger machines can choose 2B, 4B or 9B for better commands. The
+//! selected file lives in the data directory, is downloaded once, and then
+//! runs offline. Nothing here sends the user's command or output anywhere.
 
 use std::io::{Read, Write};
 use std::num::NonZeroU32;
@@ -28,8 +28,8 @@ use llama_cpp_2::model::{LlamaChatMessage, LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use sha2::{Digest, Sha256};
 
-/// One downloadable Qwen model. Q4_K_M keeps the files small enough to run on
-/// a laptop while staying accurate enough for shell commands.
+/// One downloadable command model. Q4_K_M keeps the files small enough to run
+/// on a laptop while staying accurate enough for shell commands.
 #[derive(Clone, Copy, Debug)]
 pub struct ModelSpec {
     pub id: &'static str,
@@ -57,47 +57,48 @@ impl ModelSpec {
 /// machine below its minimum, so there is never an empty picker.
 pub const MODELS: &[ModelSpec] = &[
     ModelSpec {
-        id: "qwen2.5-coder-1.5b",
-        name: "Qwen2.5-Coder 1.5B",
-        file: "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
-        url: "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
-        sha256: "cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046",
-        bytes: 1_117_320_768,
-        min_ram: 4 * GIB,
+        id: "qwen3.5-0.8b",
+        name: "Qwen3.5 0.8B",
+        file: "Qwen3.5-0.8B-Q4_K_M.gguf",
+        url:
+            "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf",
+        sha256: "bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517",
+        bytes: 532_517_120,
+        min_ram: 2 * GIB,
         recommended_ram: 4 * GIB,
-        note: "fastest, lightest",
+        note: "smallest, fastest",
     },
     ModelSpec {
-        id: "qwen2.5-coder-3b",
-        name: "Qwen2.5-Coder 3B",
-        file: "qwen2.5-coder-3b-instruct-q4_k_m.gguf",
-        url: "https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct-GGUF/resolve/main/qwen2.5-coder-3b-instruct-q4_k_m.gguf",
-        sha256: "724fb256bec1ff062b2f65e4569e871ad2e95ab2a3989723d1769c54294730b7",
-        bytes: 2_104_932_800,
+        id: "minicpm5-2b",
+        name: "MiniCPM5 2B",
+        file: "MiniCPM5-2B-Q4_K_M.gguf",
+        url: "https://huggingface.co/openbmb/MiniCPM5-2B-GGUF/resolve/main/MiniCPM5-2B-Q4_K_M.gguf",
+        sha256: "ec2d5801640099e97d8d7e8003ad4d81f336e757811f03a26173dddf386602fd",
+        bytes: 1_561_318_368,
+        min_ram: 4 * GIB,
+        recommended_ram: 6 * GIB,
+        note: "Sept 2026, balanced",
+    },
+    ModelSpec {
+        id: "qwen3.5-4b",
+        name: "Qwen3.5 4B",
+        file: "Qwen3.5-4B-Q4_K_M.gguf",
+        url: "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf",
+        sha256: "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
+        bytes: 2_740_937_888,
         min_ram: 6 * GIB,
         recommended_ram: 8 * GIB,
-        note: "balanced",
+        note: "good on 8 GB",
     },
     ModelSpec {
-        id: "qwen2.5-coder-7b",
-        name: "Qwen2.5-Coder 7B",
-        file: "qwen2.5-coder-7b-instruct-q4_k_m.gguf",
-        url: "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf",
-        sha256: "509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c",
-        bytes: 4_683_073_536,
+        id: "qwen3.5-9b",
+        name: "Qwen3.5 9B",
+        file: "Qwen3.5-9B-Q4_K_M.gguf",
+        url: "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf",
+        sha256: "03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8",
+        bytes: 5_680_522_464,
         min_ram: 10 * GIB,
-        recommended_ram: 12 * GIB,
-        note: "better multi-step",
-    },
-    ModelSpec {
-        id: "qwen2.5-coder-14b",
-        name: "Qwen2.5-Coder 14B",
-        file: "qwen2.5-coder-14b-instruct-q4_k_m.gguf",
-        url: "https://huggingface.co/Qwen/Qwen2.5-Coder-14B-Instruct-GGUF/resolve/main/qwen2.5-coder-14b-instruct-q4_k_m.gguf",
-        sha256: "c1e659736d89ac1065fb495330fb824d94001974a4bfa78e7270e43476a8d940",
-        bytes: 8_988_110_272,
-        min_ram: 16 * GIB,
-        recommended_ram: 24 * GIB,
+        recommended_ram: 14 * GIB,
         note: "best commands",
     },
 ];
@@ -105,7 +106,8 @@ pub const MODELS: &[ModelSpec] = &[
 const GIB: u64 = 1_073_741_824;
 const SELECTION_FILE: &str = "selected-model";
 
-/// The model Prompt has always shipped: the safe choice for every machine.
+/// The lightweight model shown on every machine: the safe choice when memory
+/// is tight.
 pub fn default_spec() -> &'static ModelSpec {
     &MODELS[0]
 }
@@ -158,9 +160,8 @@ pub fn resolve_choice(models_dir: &Path, configured: &str) -> Option<&'static Mo
             return Some(spec);
         }
     }
-    // Upgrade path: older versions always downloaded the 1.5B file without
-    // recording a choice (and the demo recorder prepares it directly). Do not
-    // ask again when that file is already there.
+    // If the current default file is already cached (for example from an
+    // interrupted first run), do not ask again.
     if models_dir.join(default_spec().file).is_file() {
         return Some(default_spec());
     }
@@ -187,11 +188,12 @@ const MAX_INTENT_CHARS: usize = 2000;
 
 const SYSTEM_PROMPT: &str = "\
 You turn a request into one shell command for the given shell and platform. \
-Reply with the command only: no explanation, no markdown, no backticks, no leading $ or >. \
+Reply with the command ready to run: no markdown, no backticks, and no leading $ or >. \
+If a short explanation is needed, add it as a comment of at most 20 words. \
 The directory line is the current working directory, so prefer relative paths. \
 Prefer the shortest correct command. \
 If a script is needed, use at most 30 lines. If the request is already a command, return it unchanged. \
-Use python3 to run .py files. \
+Use python3 to run .py files.
 Examples:\n\
 list all files including hidden ones => ls -la\n\
 ssh into example.com as the deploy user => ssh deploy@example.com\n\
@@ -408,7 +410,7 @@ fn ensure_model(
         events,
         notify,
         id,
-        format!("Downloading {} ({} GB)…", spec.name, spec.size_label()),
+        format!("Downloading {} ({})…", spec.name, spec.size_label()),
     );
 
     let part = path.with_extension("part");
@@ -499,7 +501,7 @@ impl QwenEngine {
         }
         let mut params = LlamaModelParams::default();
         // On Apple Silicon llama.cpp ships with Metal; offload everything.
-        // Linux release builds are CPU-only, which is fine for 1.5B Q4.
+        // Linux release builds are CPU-only, which is fine for these Q4 models.
         if cfg!(target_os = "macos") {
             params = params.with_n_gpu_layers(999);
         }
@@ -795,7 +797,7 @@ mod tests {
 
     #[test]
     fn model_catalog_is_ordered_and_unique() {
-        assert_eq!(default_spec().id, "qwen2.5-coder-1.5b");
+        assert_eq!(default_spec().id, "qwen3.5-0.8b");
         for (index, spec) in MODELS.iter().enumerate() {
             assert!(spec.bytes > 0);
             assert_eq!(spec.sha256.len(), 64);
@@ -819,20 +821,21 @@ mod tests {
 
     #[test]
     fn options_grow_with_memory() {
-        assert_eq!(options_for(8 * GIB).len(), 2);
-        assert_eq!(options_for(12 * GIB).len(), 3);
+        assert_eq!(options_for(8 * GIB).len(), 3);
+        assert_eq!(options_for(12 * GIB).len(), 4);
         assert_eq!(options_for(16 * GIB).len(), 4);
         assert_eq!(options_for(64 * GIB).len(), MODELS.len());
     }
 
     #[test]
     fn recommendation_leaves_headroom() {
-        assert_eq!(recommended_for(8 * GIB).id, "qwen2.5-coder-3b");
-        assert_eq!(recommended_for(16 * GIB).id, "qwen2.5-coder-7b");
-        assert_eq!(recommended_for(32 * GIB).id, "qwen2.5-coder-14b");
+        assert_eq!(recommended_for(8 * GIB).id, "qwen3.5-4b");
+        assert_eq!(recommended_for(12 * GIB).id, "qwen3.5-4b");
+        assert_eq!(recommended_for(16 * GIB).id, "qwen3.5-9b");
+        assert_eq!(recommended_for(32 * GIB).id, "qwen3.5-9b");
         // A model that only just fits is offered but not recommended.
-        assert!(options_for(16 * GIB)
+        assert!(options_for(12 * GIB)
             .iter()
-            .any(|spec| spec.id == "qwen2.5-coder-14b"));
+            .any(|spec| spec.id == "qwen3.5-9b"));
     }
 }

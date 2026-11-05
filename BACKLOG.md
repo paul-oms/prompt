@@ -227,11 +227,10 @@ guided generation, no API key and no network. Make it the zero-setup default for
 command generation on supported Macs.
 
 Implemented with a shared `CommandModel` path: macOS 27 uses the Swift
-Foundation Models bridge, while Linux and macOS 26 run a downloaded
-Qwen2.5-Coder 1.5B Q4 model through llama.cpp. `Cmd/Ctrl+G` (or
-`Cmd/Ctrl+Enter`) replaces the composer text with a generated command for
-review; up to 30 lines; no auto-run. The model is fetched once and verified by
-SHA-256.
+Foundation Models bridge, while Linux and macOS 26 run downloaded Qwen3.5 and
+MiniCPM5 Q4 models through llama.cpp. `Cmd/Ctrl+G` (or `Cmd/Ctrl+Enter`)
+replaces the composer text with a generated command for review; up to 30 lines;
+no auto-run. The model is fetched once and verified by SHA-256.
 
 - Add a small Swift helper exposed to Rust through a C ABI, with
   `generate command`, `explain` and `suggest fix` entry points; keep

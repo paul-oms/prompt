@@ -19,7 +19,8 @@ components; Prompt's own code is MIT (see `LICENSE`).
 | [serde](https://serde.rs) / [toml](https://github.com/toml-rs/toml) | Config and history | Apache-2.0 / MIT |
 | [dirs](https://github.com/dirs-dev/dirs-rs) | Platform directories | Apache-2.0 / MIT |
 | [llama.cpp](https://github.com/ggml-org/llama.cpp) | Local Qwen inference (Linux and macOS 26) | MIT |
-| [Qwen2.5-Coder](https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF) | Downloaded on-device command models (1.5B–14B) | Apache-2.0 |
+| [Qwen3.5](https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF) | Downloaded on-device command models (0.8B–9B) | Apache-2.0 |
+| [MiniCPM5-2B](https://huggingface.co/openbmb/MiniCPM5-2B-GGUF) | Downloaded on-device command model | Apache-2.0 |
 | [ureq](https://github.com/algesten/ureq) | One-time model download | Apache-2.0 / MIT |
 | [sha2](https://github.com/RustCrypto/hashes) | Model checksum verification | Apache-2.0 / MIT |
 

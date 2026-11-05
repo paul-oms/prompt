@@ -180,23 +180,23 @@ on-device backends as the rest of Prompt:
   framework. There is no download, no API key, no network call and no model
   picker. If Apple Intelligence is unavailable at runtime, Prompt falls back to
   the smallest Qwen model automatically.
-- **Linux and macOS 26** use Qwen2.5-Coder through llama.cpp. On the first
-  `Ctrl+G`, Prompt checks the machine's memory and GPU, then offers only the
-  models that fit: 1.5B, 3B, 7B or 14B, all quantised to Q4. The 1.5B model is
-  always offered as the lightweight choice; larger machines can pick a bigger
-  one for better multi-step commands. The recommended model is selected by
-  default and marked in the list. Your choice is remembered, and downloading
-  happens only after you confirm it.
+- **Linux and macOS 26** use Qwen3.5 and MiniCPM5 through llama.cpp. On the
+  first `Ctrl+G`, Prompt checks the machine's memory and GPU, then offers only
+  the models that fit: Qwen3.5-0.8B, MiniCPM5-2B, Qwen3.5-4B or Qwen3.5-9B,
+  all quantised to Q4. The 0.8B model is always offered as the lightweight
+  base; larger machines can pick a bigger one for better multi-step commands.
+  The recommended model is selected by default and marked in the list. Your
+  choice is remembered, and downloading happens only after you confirm it.
 
-  The smallest model is ~1.1 GB and the 14B model is ~9 GB. Prompt verifies the
-  SHA-256 of every download into `~/.local/share/prompt/models/`, and later
+  The smallest model is ~0.5 GB and the 9B model is ~5.7 GB. Prompt verifies
+  the SHA-256 of every download into `~/.local/share/prompt/models/`, and later
   generations work offline. Press `Ctrl+Shift+G` (or `Cmd+Shift+G`) to reopen
   the picker and change models.
 
 The model sees the request, the shell, the platform and the current
 directory. It does not see command output, environment variables or your
 history. Override the local model with `PROMPT_MODEL_PATH=/path/to/model.gguf`,
-force a catalogue entry with `PROMPT_MODEL=qwen2.5-coder-7b`, or override the
+force a catalogue entry with `PROMPT_MODEL=qwen3.5-4b`, or override the
 download URL with `PROMPT_MODEL_URL=...`.
 
 ## Configuration
@@ -227,7 +227,7 @@ backend = "auto"      # auto (GPU when available), gpu, or cpu
 
 [ai]
 model = ""            # empty = ask on first use, then remember
-                      # qwen2.5-coder-1.5b, -3b, -7b, or -14b
+                      # qwen3.5-0.8b, minicpm5-2b, qwen3.5-4b, or qwen3.5-9b
 ```
 
 ## GPU rendering

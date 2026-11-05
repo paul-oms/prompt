@@ -192,7 +192,7 @@ backend = "auto"
 
 [ai]
 # Command model for Linux and macOS 26. Empty = ask on first use, then remember.
-# qwen2.5-coder-1.5b, qwen2.5-coder-3b, qwen2.5-coder-7b, qwen2.5-coder-14b
+# qwen3.5-0.8b, minicpm5-2b, qwen3.5-4b, qwen3.5-9b
 model = ""
 "#;
 
