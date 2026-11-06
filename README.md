@@ -114,6 +114,7 @@ Prompt is designed for both macOS and Linux. `Cmd` means `Cmd` on macOS and
 | --- | --- | --- |
 | Run command | `Enter` | `Enter` |
 | Generate a command (don't run) | `Cmd+G` (or `Cmd+Enter`) | `Ctrl+G` (or `Ctrl+Enter`) |
+| Apply a suggested fix | `Enter` on an empty composer, or click it | same |
 | New line | `Shift+Enter` | `Shift+Enter` |
 | Previous / next history or completion | `Up` / `Down` | `Up` / `Down` |
 | Search history | `Cmd+R` | `Ctrl+R` |
@@ -193,11 +194,26 @@ on-device backends as the rest of Prompt:
   generations work offline. Press `Ctrl+Shift+G` (or `Cmd+Shift+G`) to reopen
   the picker and change models.
 
-The model sees the request, the shell, the platform and the current
-directory. It does not see command output, environment variables or your
-history. Override the local model with `PROMPT_MODEL_PATH=/path/to/model.gguf`,
-force a catalogue entry with `PROMPT_MODEL=qwen3.5-4b`, or override the
-download URL with `PROMPT_MODEL_URL=...`.
+### Automatic fixes
+
+When a command exits non-zero, Prompt automatically asks the model for a
+replacement command in the background. The request includes the failed
+command, its exit code, the working directory and up to the last 300 lines of
+that command's output. The answer appears in a strip above the composer;
+press `Enter` (or click the strip) to put it in the editor, or `Esc` to
+dismiss it. A suggestion is never run on its own.
+
+Automatic fixes reuse the model you already chose and never open the model
+picker or start a download by themselves. `Ctrl-C` and `SIGTERM` interrupts
+are ignored, and repeated failures of the same command are capped to avoid a
+suggestion loop. Turn the feature off with `[ai] auto_fix = false`.
+
+The model sees the request, the shell, the platform, the current directory,
+and for automatic fixes the failed command and its recent output. It does not
+see environment variables or your history. Override the local model with
+`PROMPT_MODEL_PATH=/path/to/model.gguf`, force a catalogue entry with
+`PROMPT_MODEL=qwen3.5-4b`, or override the download URL with
+`PROMPT_MODEL_URL=...`.
 
 ## Configuration
 
@@ -228,6 +244,7 @@ backend = "auto"      # auto (GPU when available), gpu, or cpu
 [ai]
 model = ""            # empty = ask on first use, then remember
                       # qwen3.5-0.8b, minicpm5-2b, qwen3.5-4b, or qwen3.5-9b
+auto_fix = true       # suggest a fix when a command exits non-zero
 ```
 
 ## GPU rendering

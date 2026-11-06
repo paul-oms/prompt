@@ -289,6 +289,10 @@ When a command exits non-zero, offer “Explain” and “Suggest a fix”. Show
 stderr + command + cwd context, a diff-style proposed command, and a copy/run
 action. Never auto-run.
 
+*Partial:* automatic fix suggestions shipped (command + exit code + recent
+output, shown above the composer). Remaining: an explicit “Explain” action and
+a richer diff-style card.
+
 ### AGENT-05 · Context attachments
 `@` mentions for files and directories, “attach last output”, “attach git
 diff”, “attach current error”. Visible context chips above the composer with
@@ -494,7 +498,7 @@ help without joining a Discord.
 | 11 | CORE-04 | Global scrollback search | Block search shipped | 4 | M | H | Agent output is long |
 | 12 | CI-01 | UI smoke tests | Hooks shipped | 4 | M | H | Protects every release |
 | 13 | DIST-01 | Linux packages | Not started | 4 | M | H | Getting users |
-| 14 | AGENT-04 | Error explain/fix | Not started | 4 | M | M | Clear user value |
+| 14 | AGENT-04 | Error explain/fix | Partial | 4 | M | M | Clear user value |
 | 15 | DISC-03 | Error cards | Not started | 4 | M | M | Plain-language failures |
 | 16 | SHELL-01 | Fish integration | Not started | 3 | M | M | Broader shell coverage |
 | 17 | SHELL-02 | Bundled zsh | Script shipped | 3 | M | H | True zero-config Linux |

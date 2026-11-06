@@ -180,11 +180,16 @@ pub const MAX_LINES: usize = 30;
 
 // Enough for the system prompt, a long intent and a 30-line command. Keeping
 // this tight matters on laptops: the KV cache and compute buffer are the
-// difference between a snappy first command and swapping.
+// difference between a snappy first command and swapping. Fix requests also
+// carry terminal output, so they get the larger budget below.
 const N_CTX: u32 = 2048;
+const N_CTX_FIX: u32 = 8192;
 const N_BATCH: u32 = 256;
 const MAX_OUTPUT_TOKENS: usize = 1536;
 const MAX_INTENT_CHARS: usize = 2000;
+/// Fix requests include the tail of the terminal output, capped so the prompt
+/// stays inside `N_CTX_FIX` even when the failed command printed a lot.
+pub const MAX_FIX_OUTPUT_CHARS: usize = 12_000;
 
 const SYSTEM_PROMPT: &str = "\
 You turn a request into one shell command for the given shell and platform. \
@@ -200,12 +205,37 @@ ssh into example.com as the deploy user => ssh deploy@example.com\n\
 find the biggest files here => du -ah . | sort -rh | head -20\n\
 run script.py => python3 script.py";
 
+const FIX_SYSTEM_PROMPT: &str = "\
+You fix a shell command that failed. You get the shell, platform, working directory, \
+the failed command, its exit code and the end of its terminal output. \
+Reply with one replacement shell command ready to run: no markdown, no backticks, and no leading $ or >. \
+Keep the user's intent and change only what is needed to make the command succeed. \
+Use the output to identify the cause, such as a typo, a missing file, a missing tool or a dependency error. \
+If a short explanation is needed, add it as a comment of at most 20 words. \
+The directory line is the current working directory, so prefer relative paths. \
+Prefer the shortest correct command. If a script is needed, use at most 30 lines. \
+Examples:\n\
+failed command: gti status / exit 127 / output: command not found: gti => git status\n\
+failed command: python3 app.py / exit 1 / output: ModuleNotFoundError: No module named requests => pip install requests && python3 app.py\n\
+failed command: cd Documnets / exit 1 / output: no such file or directory => cd Documents";
+
+/// The failed command and enough output to explain why it failed. Only fix
+/// requests carry this; ordinary command generation never sees command output.
+#[derive(Clone, Debug, Default)]
+pub struct FixContext {
+    pub command: String,
+    pub exit_code: Option<i32>,
+    pub output: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct Request {
     pub id: u64,
     pub intent: String,
     pub shell: String,
     pub cwd: String,
+    /// Present when the request is a suggested fix rather than a new command.
+    pub fix: Option<FixContext>,
     /// The GGUF model to use for this request. Ignored by Apple Foundation
     /// Models, which are built into the OS.
     pub model: &'static ModelSpec,
@@ -294,7 +324,11 @@ fn worker(
         let backend = selected_backend();
         let result = match backend {
             "Apple Foundation Models" => {
-                let prompt = format!("{SYSTEM_PROMPT}\n\n{}", build_prompt(&request));
+                let prompt = format!(
+                    "{}\n\n{}",
+                    system_prompt_for(&request),
+                    build_prompt(&request)
+                );
                 crate::apple_fm::generate(&prompt).and_then(|text| sanitize(&text))
             }
             _ => {
@@ -523,7 +557,7 @@ impl QwenEngine {
         events: &Sender<Event>,
         notify: &(dyn Fn() + Send + Sync),
     ) -> Result<String, String> {
-        let system = LlamaChatMessage::new("system".into(), SYSTEM_PROMPT.into())
+        let system = LlamaChatMessage::new("system".into(), system_prompt_for(request).into())
             .map_err(|err| format!("could not build the prompt: {err}"))?;
         let user = LlamaChatMessage::new("user".into(), build_prompt(request))
             .map_err(|err| format!("could not build the prompt: {err}"))?;
@@ -540,12 +574,17 @@ impl QwenEngine {
             .map(|n| n.get().min(8) as i32)
             .unwrap_or(4)
             .max(1);
+        let n_ctx = if request.fix.is_some() {
+            N_CTX_FIX
+        } else {
+            N_CTX
+        };
         let mut ctx = self
             .model
             .new_context(
                 &self.backend,
                 LlamaContextParams::default()
-                    .with_n_ctx(NonZeroU32::new(N_CTX))
+                    .with_n_ctx(NonZeroU32::new(n_ctx))
                     .with_n_batch(N_BATCH)
                     .with_n_threads(threads)
                     .with_n_threads_batch(threads),
@@ -605,7 +644,33 @@ impl QwenEngine {
     }
 }
 
+fn system_prompt_for(request: &Request) -> &'static str {
+    if request.fix.is_some() {
+        FIX_SYSTEM_PROMPT
+    } else {
+        SYSTEM_PROMPT
+    }
+}
+
 fn build_prompt(request: &Request) -> String {
+    if let Some(fix) = &request.fix {
+        let output = if fix.output.trim().is_empty() {
+            "(no output)".to_string()
+        } else {
+            truncate_chars(fix.output.trim_end(), MAX_FIX_OUTPUT_CHARS)
+        };
+        return format!(
+            "shell: {}\nplatform: {}\ndirectory: {}\nfailed command: {}\nexit code: {}\nterminal output:\n---\n{}\n---\nrequest: replace the failed command with one that succeeds",
+            request.shell,
+            std::env::consts::OS,
+            request.cwd,
+            truncate_chars(fix.command.trim(), MAX_INTENT_CHARS),
+            fix.exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            output
+        );
+    }
     let intent = truncate_chars(request.intent.trim(), MAX_INTENT_CHARS);
     format!(
         "shell: {}\nplatform: {}\ndirectory: {}\nrequest: {}",
@@ -756,6 +821,7 @@ mod tests {
                 intent: intent.into(),
                 shell: "zsh".into(),
                 cwd: "/tmp".into(),
+                fix: None,
                 model: default_spec(),
                 cancel: Arc::new(AtomicBool::new(false)),
             });
@@ -786,6 +852,7 @@ mod tests {
             intent: "ssh into the deploy box".into(),
             shell: "zsh".into(),
             cwd: "/srv/app".into(),
+            fix: None,
             model: default_spec(),
             cancel: Arc::new(AtomicBool::new(false)),
         };
@@ -793,6 +860,28 @@ mod tests {
         assert!(prompt.contains("shell: zsh"));
         assert!(prompt.contains("directory: /srv/app"));
         assert!(prompt.contains("ssh into the deploy box"));
+    }
+
+    #[test]
+    fn fix_prompt_includes_command_exit_and_output() {
+        let request = Request {
+            id: 1,
+            intent: String::new(),
+            shell: "bash".into(),
+            cwd: "/srv/app".into(),
+            fix: Some(FixContext {
+                command: "gti status".into(),
+                exit_code: Some(127),
+                output: "bash: gti: command not found".into(),
+            }),
+            model: default_spec(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let prompt = build_prompt(&request);
+        assert!(system_prompt_for(&request).starts_with("You fix a shell command"));
+        assert!(prompt.contains("failed command: gti status"));
+        assert!(prompt.contains("exit code: 127"));
+        assert!(prompt.contains("bash: gti: command not found"));
     }
 
     #[test]

@@ -286,6 +286,14 @@ struct Toast {
     until: Instant,
 }
 
+/// What the in-flight generation is for. Fix requests arrive as a suggestion
+/// above the composer; compose requests fill the composer directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GenerationKind {
+    Compose,
+    Fix,
+}
+
 /// A command-generation request currently in flight. The id lets the UI ignore
 /// a result that arrives after the user cancelled or started another request.
 struct Generation {
@@ -294,6 +302,25 @@ struct Generation {
     backend: &'static str,
     status: String,
     cancel: Arc<AtomicBool>,
+    kind: GenerationKind,
+    /// The failed command a fix request is about. Empty for compose requests.
+    source: String,
+}
+
+/// A model-generated replacement for a command that just failed. It waits
+/// above the composer until the user applies or dismisses it.
+struct FixSuggestion {
+    command: String,
+    source: String,
+    backend: &'static str,
+}
+
+/// Consecutive failures of the same command are capped so a suggestion that
+/// also fails does not start an endless request loop.
+#[derive(Clone, Debug)]
+struct AutoFixState {
+    command: String,
+    attempts: u8,
 }
 
 /// One command's place in the terminal's scrollback. Rows are absolute, i.e.
@@ -431,6 +458,10 @@ const BLOCK_WINDOW: u64 = 300;
 const BLOCK_COLLAPSE_HEAD: u64 = 6;
 /// Newest output rows kept visible below a folded middle.
 const BLOCK_COLLAPSE_TAIL: u64 = 24;
+/// Recent output rows sent with an automatic fix request. The model prompt
+/// applies a character cap on top so a single huge line cannot blow the
+/// context.
+const AUTO_FIX_OUTPUT_LINES: usize = 300;
 
 /// Actions offered for the block currently open in block view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -538,6 +569,10 @@ pub struct PromptApp {
     model: model::Client,
     generation: Option<Generation>,
     next_generation: u64,
+    fix_suggestion: Option<FixSuggestion>,
+    auto_fix_state: Option<AutoFixState>,
+    /// Clickable rectangle of the fix banner, set while painting.
+    fix_rect: Option<(f32, f32, f32, f32)>,
     /// The Qwen file to use on Linux and macOS 26. `None` means the picker has
     /// not run yet; macOS 27 uses Foundation Models and ignores this.
     model_choice: Option<&'static model::ModelSpec>,
@@ -706,6 +741,9 @@ impl PromptApp {
             model,
             generation: None,
             next_generation: 1,
+            fix_suggestion: None,
+            auto_fix_state: None,
+            fix_rect: None,
             model_choice,
             model_picker: None,
             mode: if launch_integrated {
@@ -1508,6 +1546,7 @@ impl PromptApp {
         if id == self.active_pane || self.pane_index(id).is_none() {
             return;
         }
+        self.clear_fix_context();
         let fallback_cwd = self.cwd.clone();
         self.store_active();
         self.active_pane = id;
@@ -1556,6 +1595,7 @@ impl PromptApp {
         self.pane_tree = split_leaf(tree, id, new_id, axis);
         self.panes.push(PaneSlot::new(new_id));
 
+        self.clear_fix_context();
         self.store_active();
         self.active_pane = new_id;
         self.apply_state(PaneState::new(cwd.clone(), self.launch.integrated));
@@ -1597,6 +1637,7 @@ impl PromptApp {
         }
         let was_active = id == self.active_pane;
         if was_active {
+            self.clear_fix_context();
             self.store_active();
         }
         let slot = &mut self.panes[index];
@@ -1996,6 +2037,7 @@ impl PromptApp {
             };
             (session.drain_events(), session.pwd(), session.title())
         };
+        let mut failed = None;
         for event in events {
             match event {
                 TermEvent::PromptStart => {
@@ -2024,8 +2066,12 @@ impl PromptApp {
                 TermEvent::CommandEnd { exit_code } => {
                     if let Some(code) = exit_code {
                         self.last_status = Some((code, Instant::now()));
+                        if code == 0 {
+                            self.auto_fix_state = None;
+                        }
                     }
                     self.end_block(exit_code);
+                    failed = Some(exit_code);
                 }
                 TermEvent::Bell => {
                     self.toast("Bell");
@@ -2052,6 +2098,9 @@ impl PromptApp {
                     window.set_title(&format!("{} — Prompt", self.title));
                 }
             }
+        }
+        if let Some(exit_code) = failed.flatten() {
+            self.maybe_auto_fix(Some(exit_code));
         }
         self.grid_dirty = true;
         self.request_redraw();
@@ -2958,6 +3007,7 @@ impl PromptApp {
         if index >= self.background.len() {
             return;
         }
+        self.clear_fix_context();
         let mut tab = self.background.remove(index);
         // Keep whatever the user was doing: the current tab moves into the
         // panel so the two tabs simply swap.
@@ -3482,8 +3532,18 @@ impl PromptApp {
 
         // Enter is special: submit, or newline with Shift.
         if code == KeyCode::Enter || code == KeyCode::NumpadEnter {
-            if self.generation.is_some() {
-                self.toast("Still generating — esc to cancel");
+            if let Some(generation) = &self.generation {
+                if generation.kind == GenerationKind::Fix {
+                    // A background fix must not stop the user from running
+                    // the next command.
+                    self.cancel_fix_generation();
+                } else {
+                    self.toast("Still generating — esc to cancel");
+                    return true;
+                }
+            }
+            if self.fix_suggestion.is_some() && self.editor.is_empty() {
+                self.apply_fix_suggestion();
                 return true;
             }
             if self.completion_popup.is_some() {
@@ -3501,6 +3561,11 @@ impl PromptApp {
         }
 
         if code == KeyCode::Escape {
+            if self.fix_suggestion.take().is_some() {
+                self.fix_rect = None;
+                self.request_redraw();
+                return true;
+            }
             if self.generation.is_some() {
                 self.cancel_generation();
                 return true;
@@ -3531,7 +3596,9 @@ impl PromptApp {
         }
 
         if code == KeyCode::Tab {
-            if shift {
+            if !shift && self.fix_suggestion.is_some() && self.editor.is_empty() {
+                self.apply_fix_suggestion();
+            } else if shift {
                 self.cycle_completion(true);
             } else {
                 self.tab_complete();
@@ -3797,13 +3864,20 @@ impl PromptApp {
     /// Turn the composer text into a request and let the background model
     /// worker fill the composer with a command. Never runs anything.
     fn generate_command(&mut self) {
-        if self.generation.is_some() {
-            self.toast("Still generating — esc to cancel");
-            return;
+        if let Some(generation) = &self.generation {
+            if generation.kind == GenerationKind::Fix {
+                // A background fix should never block an explicit request.
+                self.cancel_fix_generation();
+            } else {
+                self.toast("Still generating — esc to cancel");
+                return;
+            }
         }
         if self.mode != Mode::Compose || self.block_view.is_some() {
             return;
         }
+        self.fix_suggestion = None;
+        self.fix_rect = None;
 
         let intent = self.editor.text().trim().to_string();
         if intent.is_empty() {
@@ -3952,7 +4026,15 @@ impl PromptApp {
 
     fn start_generation(&mut self, spec: &'static model::ModelSpec) {
         if self.generation.is_some() {
-            return;
+            if self
+                .generation
+                .as_ref()
+                .is_some_and(|generation| generation.kind == GenerationKind::Fix)
+            {
+                self.cancel_fix_generation();
+            } else {
+                return;
+            }
         }
         let intent = self.editor.text().trim().to_string();
         if intent.is_empty() {
@@ -3975,6 +4057,7 @@ impl PromptApp {
             intent,
             shell: self.launch.kind.name().to_string(),
             cwd,
+            fix: None,
             model: spec,
             cancel: cancel.clone(),
         });
@@ -3988,6 +4071,8 @@ impl PromptApp {
                 format!("Preparing {}…", spec.name)
             },
             cancel,
+            kind: GenerationKind::Compose,
+            source: String::new(),
         });
         self.focus = Focus::Composer;
         self.cursor_on = true;
@@ -3999,6 +4084,186 @@ impl PromptApp {
             generation.cancel.store(true, Ordering::Relaxed);
             self.toast("Generation cancelled");
         }
+        self.request_redraw();
+    }
+
+    /// Forget a pending fix when the active shell changes: its cwd and history
+    /// may no longer match the suggestion.
+    fn clear_fix_context(&mut self) {
+        self.cancel_fix_generation();
+        self.fix_suggestion = None;
+        self.fix_rect = None;
+        self.auto_fix_state = None;
+        self.request_redraw();
+    }
+
+    /// Cancel a background fix request without taking over the UI. Explicit
+    /// generation, submitting, or pressing Esc should not be blocked by it.
+    fn cancel_fix_generation(&mut self) {
+        if self
+            .generation
+            .as_ref()
+            .is_some_and(|generation| generation.kind == GenerationKind::Fix)
+        {
+            if let Some(generation) = self.generation.take() {
+                generation.cancel.store(true, Ordering::Relaxed);
+            }
+            self.request_redraw();
+        }
+    }
+
+    /// The model to use for an automatic fix. Unlike `generate_command`, this
+    /// never opens the picker and never starts a download: a fix only runs
+    /// when the chosen model is already cached.
+    fn fix_model_spec(&self) -> Option<&'static model::ModelSpec> {
+        if self.model.is_apple_fm() || crate::hardware::is_macos_27() {
+            return Some(model::default_spec());
+        }
+        let spec = self.model_choice?;
+        let path = match std::env::var_os("PROMPT_MODEL_PATH") {
+            Some(path) => PathBuf::from(path),
+            None => self.paths.models_dir().join(spec.file),
+        };
+        path.is_file().then_some(spec)
+    }
+
+    /// Ask the model for a fix after a failure. Runs in the background and
+    /// only ever produces a suggestion; nothing is executed.
+    fn start_fix_generation(&mut self, command: String, exit_code: i32, output: String) -> bool {
+        if self.generation.is_some() || command.trim().is_empty() {
+            return false;
+        }
+        let Some(spec) = self.fix_model_spec() else {
+            // The user has not chosen a command model yet. Do not surprise
+            // them with a picker or a download; Ctrl+G still works.
+            return false;
+        };
+        let id = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let backend = self.model.backend();
+        let cwd = if self.cwd.as_os_str().is_empty() {
+            ".".to_string()
+        } else {
+            self.cwd.display().to_string()
+        };
+
+        self.model.request(model::Request {
+            id,
+            intent: String::new(),
+            shell: self.launch.kind.name().to_string(),
+            cwd,
+            fix: Some(model::FixContext {
+                command: command.clone(),
+                exit_code: Some(exit_code),
+                output,
+            }),
+            model: spec,
+            cancel: cancel.clone(),
+        });
+        self.generation = Some(Generation {
+            id,
+            started: Instant::now(),
+            backend,
+            status: if self.model.is_apple_fm() {
+                "Looking for a fix…".into()
+            } else {
+                format!("Preparing {}…", spec.name)
+            },
+            cancel,
+            kind: GenerationKind::Fix,
+            source: command,
+        });
+        self.request_redraw();
+        true
+    }
+
+    /// Start an automatic fix after a foreground command exits non-zero.
+    fn maybe_auto_fix(&mut self, exit_code: Option<i32>) {
+        if !self.config.ai.auto_fix {
+            return;
+        }
+        // Ctrl-C and SIGTERM are deliberate interruptions, not failures worth
+        // fixing. Full-screen programs also have no readable block output.
+        let Some(exit_code) = exit_code.filter(|code| *code != 0 && *code != 130 && *code != 143)
+        else {
+            return;
+        };
+        if self.generation.is_some()
+            || self.block_view.is_some()
+            || self
+                .session
+                .as_ref()
+                .map(|session| session.frame().alt_screen)
+                .unwrap_or(true)
+        {
+            return;
+        }
+        let Some(index) = self.blocks.len().checked_sub(1) else {
+            return;
+        };
+        let command = self
+            .blocks
+            .get(index)
+            .map(|block| block.command.trim().to_string())
+            .unwrap_or_default();
+        if command.is_empty() {
+            return;
+        }
+
+        // Stop after two attempts at the same command so a bad suggestion
+        // cannot bounce between the model and the shell forever.
+        let attempt = match &self.auto_fix_state {
+            Some(state) if state.command == command => {
+                if state.attempts >= 2 {
+                    return;
+                }
+                state.attempts + 1
+            }
+            _ => 1,
+        };
+
+        let output = self.block_tail_text(index, AUTO_FIX_OUTPUT_LINES);
+        if self.start_fix_generation(command.clone(), exit_code, output) {
+            self.auto_fix_state = Some(AutoFixState {
+                command,
+                attempts: attempt,
+            });
+        }
+    }
+
+    /// The last `max_lines` rows of a finished block's output, capped again by
+    /// the model prompt budget.
+    fn block_tail_text(&mut self, index: usize, max_lines: usize) -> String {
+        let Some((start, end)) = self
+            .blocks
+            .get(index)
+            .and_then(|block| block.output_range())
+        else {
+            return String::new();
+        };
+        let start = end
+            .saturating_sub(max_lines.saturating_sub(1) as u64)
+            .max(start);
+        let text = self.block_text(start, end).join("\n");
+        let text = text.trim_end();
+        if text.trim().is_empty() {
+            return String::new();
+        }
+        tail_chars(text, model::MAX_FIX_OUTPUT_CHARS)
+    }
+
+    fn apply_fix_suggestion(&mut self) {
+        let Some(fix) = self.fix_suggestion.take() else {
+            return;
+        };
+        self.fix_rect = None;
+        self.editor.set_text(&fix.command);
+        self.history_index = None;
+        self.completion_popup = None;
+        self.focus = Focus::Composer;
+        self.after_edit();
+        self.toast("Suggested fix applied — enter to run, esc to clear");
         self.request_redraw();
     }
 
@@ -4019,12 +4284,27 @@ impl PromptApp {
                     elapsed,
                     backend,
                 } => {
-                    let current = self.generation.as_ref().map(|g| g.id);
-                    if current != Some(id) {
+                    let Some(generation) = &self.generation else {
+                        continue;
+                    };
+                    if generation.id != id {
                         continue;
                     }
+                    let kind = generation.kind;
+                    let source = generation.source.clone();
                     self.generation = None;
                     match result {
+                        Ok(command) if kind == GenerationKind::Fix => {
+                            self.fix_suggestion = Some(FixSuggestion {
+                                command,
+                                source,
+                                backend,
+                            });
+                            self.toast(format!(
+                                "{backend} suggested a fix — enter or click to apply"
+                            ));
+                            self.request_redraw();
+                        }
                         Ok(command) => {
                             self.editor.set_text(&command);
                             self.history_index = None;
@@ -4049,10 +4329,17 @@ impl PromptApp {
     // ---- submitting -------------------------------------------------------
 
     fn submit(&mut self) {
-        if self.generation.is_some() {
-            self.toast("Still generating — esc to cancel");
-            return;
+        if let Some(generation) = &self.generation {
+            if generation.kind == GenerationKind::Fix {
+                // Running something new supersedes a pending fix.
+                self.cancel_fix_generation();
+            } else {
+                self.toast("Still generating — esc to cancel");
+                return;
+            }
         }
+        self.fix_suggestion = None;
+        self.fix_rect = None;
         self.begin_dock();
         if self.block_view.is_some() {
             self.close_block_view();
@@ -4611,6 +4898,14 @@ impl PromptApp {
                 }
             }
         }
+        if state == ElementState::Pressed {
+            if let Some((fx, fy, fw, fh)) = self.fix_rect {
+                if x >= fx && x < fx + fw && y >= fy && y < fy + fh {
+                    self.apply_fix_suggestion();
+                    return;
+                }
+            }
+        }
         // The composer is checked before the terminal: a multi-line composer
         // grows upwards over the top of the grid, and clicks on those lines
         // belong to the editor, not to the scrollback behind it.
@@ -4753,6 +5048,16 @@ impl PromptApp {
             self.request_redraw();
         }
         if block_action.is_some() || self.collapsed_marker_at(x, y).is_some() {
+            if let Some(window) = &self.window {
+                window.set_cursor(winit::window::CursorIcon::Pointer);
+            }
+            return;
+        }
+        if self
+            .fix_rect
+            .map(|(fx, fy, fw, fh)| x >= fx && x < fx + fw && y >= fy && y < fy + fh)
+            .unwrap_or(false)
+        {
             if let Some(window) = &self.window {
                 window.set_cursor(winit::window::CursorIcon::Pointer);
             }
@@ -5216,6 +5521,7 @@ impl PromptApp {
             self.draw_card((0.0, 0.0));
             self.draw_single_controls();
         }
+        self.draw_fix_suggestion();
         self.draw_background_panel();
         self.draw_welcome();
         self.draw_search();
@@ -7086,6 +7392,128 @@ impl PromptApp {
         }
     }
 
+    /// A suggestion strip just above the composer. The command is never run
+    /// from here; clicking or pressing Enter puts it in the editor.
+    fn draw_fix_suggestion(&mut self) {
+        self.fix_rect = None;
+        if self.block_view.is_some() {
+            return;
+        }
+        let pending = self
+            .generation
+            .as_ref()
+            .filter(|generation| generation.kind == GenerationKind::Fix);
+        let ready = self.fix_suggestion.is_some();
+        let (title, hint, command_lines) = if let Some(fix) = &self.fix_suggestion {
+            let source = command_preview(&fix.source, 52);
+            let title = if source.is_empty() {
+                format!("Suggested fix · {}", fix.backend)
+            } else {
+                format!("Fix for {source} · {}", fix.backend)
+            };
+            let hint = if self.editor.is_empty() {
+                "↵ apply   esc dismiss".to_string()
+            } else {
+                "click to apply   esc dismiss".to_string()
+            };
+            let lines = fix
+                .command
+                .lines()
+                .take(3)
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            (title, hint, lines)
+        } else if let Some(generation) = pending {
+            (
+                format!("Looking for a fix · {}", generation.backend),
+                "esc cancel".to_string(),
+                vec![generation.status.clone()],
+            )
+        } else {
+            return;
+        };
+        let card = self.card;
+        if card.w <= 1.0 {
+            return;
+        }
+        let scale = self.scale;
+        let s = |v: f32| (v * scale).round();
+        let cell_h = self.text.cell_h;
+        let cell_w = self.text.cell_w;
+        let pad = s(10.0);
+        let gap = s(9.0);
+        let radius = s(9.0);
+        let theme = self.theme.clone();
+        let shown = command_lines.len().max(1);
+        let h = pad * 2.0 + cell_h * (1.0 + shown as f32);
+        let x = card.x;
+        let w = card.w;
+        let y = (card.y - gap - h).max(s(10.0));
+
+        let Some(canvas) = self.canvas.as_mut() else {
+            return;
+        };
+        let mut painter = Painter {
+            canvas,
+            text: &mut self.text,
+            scale,
+        };
+        painter.rounded(x, y + s(3.0), w, h, radius, theme.shadow, 0.45);
+        painter.rounded(x, y, w, h, radius, theme.panel_raised, 0.98);
+        painter.rounded_stroke(
+            x,
+            y,
+            w,
+            h,
+            radius,
+            (1.0 * scale).max(1.0),
+            theme.border,
+            0.9,
+        );
+        painter.fill(x, y + radius * 0.5, s(3.0), h - radius, theme.accent, 0.85);
+
+        let clip = Clip::new(x + pad, y + pad, (w - pad * 2.0).max(1.0), h - pad * 2.0);
+        let hint_w = painter.text.measure_text(&hint, false);
+        let title_w = (w - pad * 2.0 - hint_w - s(14.0)).max(10.0);
+        painter.text(
+            x + pad,
+            y + pad,
+            &title,
+            theme.dim,
+            false,
+            None,
+            Clip::new(x + pad, y + pad, title_w, cell_h),
+            title_w,
+        );
+        painter.text(
+            x + w - pad - hint_w,
+            y + pad,
+            &hint,
+            theme.faint,
+            false,
+            None,
+            Clip::new(x + w - pad - hint_w, y + pad, hint_w + 2.0, cell_h),
+            hint_w + 2.0,
+        );
+        for (index, line) in command_lines.iter().enumerate() {
+            let ly = y + pad + cell_h * (1.0 + index as f32);
+            painter.text(
+                x + pad,
+                ly,
+                line,
+                theme.fg,
+                false,
+                Some(cell_w),
+                clip,
+                w - pad * 2.0,
+            );
+        }
+
+        if ready {
+            self.fix_rect = Some((x, y, w, h));
+        }
+    }
+
     fn draw_toast(&mut self) {
         let Some(toast) = &self.toast else { return };
         if Instant::now() > toast.until {
@@ -8152,6 +8580,25 @@ fn normalize_paste(text: &str) -> String {
 
 /// A single-line preview of a block command for headers. Multi-line commands
 /// get a return hint so the bar never grows into a paragraph.
+/// Keep the end of a long string, marking that earlier text was dropped.
+/// Used for terminal output sent to the fix model, where the newest lines
+/// carry the error.
+fn tail_chars(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let start = text
+        .char_indices()
+        .rev()
+        .nth(max_chars - 1)
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    format!("…\n{}", &text[start..])
+}
+
 fn command_preview(command: &str, max_chars: usize) -> String {
     let first = command
         .lines()
@@ -8418,6 +8865,14 @@ mod split_tests {
         assert_eq!(command_preview("  ls -la  ", 20), "ls -la");
         assert_eq!(command_preview("echo one\necho two", 20), "echo one…");
         assert_eq!(command_preview("abcdef", 3), "abc…");
+    }
+
+    #[test]
+    fn tail_chars_keeps_the_end_and_respects_unicode() {
+        assert_eq!(tail_chars("abcdef", 10), "abcdef");
+        assert_eq!(tail_chars("abcdef", 3), "…\ndef");
+        assert_eq!(tail_chars("αβγδε", 2), "…\nδε");
+        assert_eq!(tail_chars("abcdef", 0), "");
     }
 
     #[test]

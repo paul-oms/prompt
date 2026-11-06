@@ -101,12 +101,16 @@ pub struct Ai {
     /// Force a command model by id. Empty means remember the picker's choice,
     /// or ask on first use.
     pub model: String,
+    /// After a command exits non-zero, ask the model for a fix and show it
+    /// above the composer. It is never run automatically.
+    pub auto_fix: bool,
 }
 
 impl Default for Ai {
     fn default() -> Self {
         Self {
             model: String::new(),
+            auto_fix: true,
         }
     }
 }
@@ -194,6 +198,9 @@ backend = "auto"
 # Command model for Linux and macOS 26. Empty = ask on first use, then remember.
 # qwen3.5-0.8b, minicpm5-2b, qwen3.5-4b, qwen3.5-9b
 model = ""
+# After a command fails, suggest a fix using the command and recent output.
+# Suggestions are shown above the composer and never run on their own.
+auto_fix = true
 "#;
 
 /// Load config, creating the config directory and a commented default file on
